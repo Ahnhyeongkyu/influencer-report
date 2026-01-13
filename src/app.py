@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 # 프로젝트 모듈 임포트
 from src.auth import is_authenticated, show_login_form, show_user_info, init_session_state
+from src.platform_auth import (
+    init_platform_auth_state,
+    render_platform_auth_section,
+    get_platform_cookies,
+    is_platform_authenticated,
+)
 from src.utils.url_parser import (
     parse_urls,
     parse_csv_urls,
@@ -120,6 +126,7 @@ st.markdown(
 def init_app_state():
     """앱 상태 초기화"""
     init_session_state()
+    init_platform_auth_state()
 
     if "campaign_info" not in st.session_state:
         st.session_state.campaign_info = {
@@ -177,7 +184,18 @@ def render_sidebar():
         st.markdown("---")
         st.markdown("### 지원 플랫폼")
         for platform, display_name in PLATFORM_DISPLAY_NAMES.items():
-            st.markdown(f"- {display_name}")
+            # 인증 상태 표시
+            if platform == "youtube":
+                status = "✅"  # YouTube는 항상 OK
+            elif is_platform_authenticated(platform):
+                status = "✅"
+            else:
+                status = "⚠️"
+            st.markdown(f"- {status} {display_name}")
+
+        # 플랫폼 인증 설정
+        st.markdown("---")
+        render_platform_auth_section()
 
         # 로그아웃 버튼
         show_user_info()
@@ -302,6 +320,77 @@ def get_crawler_for_platform(platform: str):
     return crawlers.get(platform)
 
 
+def crawl_with_cookies(platform: str, url: str) -> dict:
+    """
+    쿠키를 포함하여 크롤링 수행
+
+    Args:
+        platform: 플랫폼 이름
+        url: 크롤링할 URL
+
+    Returns:
+        크롤링 결과
+    """
+    cookies = get_platform_cookies(platform)
+    crawler = get_crawler_for_platform(platform)
+
+    if not crawler:
+        return {
+            "platform": platform,
+            "url": url,
+            "error": f"지원하지 않는 플랫폼: {platform}",
+            "crawled_at": datetime.now().isoformat(),
+        }
+
+    try:
+        # YouTube는 쿠키 불필요
+        if platform == "youtube":
+            return crawler(url)
+
+        # 다른 플랫폼은 쿠키와 함께 크롤링
+        # 각 크롤러 클래스에서 쿠키 처리
+        if platform == "instagram":
+            from src.crawlers.instagram_crawler import InstagramCrawler
+            with InstagramCrawler(headless=True, use_api=True) as crawler_instance:
+                # 쿠키가 있으면 세션에 적용
+                if cookies and crawler_instance.session:
+                    crawler_instance.session.cookies.update(cookies)
+                return crawler_instance.crawl_post(url)
+
+        elif platform == "facebook":
+            from src.crawlers.facebook_crawler import FacebookCrawler
+            with FacebookCrawler(headless=True, use_api=True) as crawler_instance:
+                if cookies and crawler_instance.session:
+                    crawler_instance.session.cookies.update(cookies)
+                return crawler_instance.crawl_post(url)
+
+        elif platform == "xiaohongshu":
+            from src.crawlers.xhs_crawler import XHSCrawler
+            with XHSCrawler(headless=True, use_api=True) as crawler_instance:
+                if cookies and crawler_instance.session:
+                    crawler_instance.session.cookies.update(cookies)
+                return crawler_instance.crawl_post(url)
+
+        elif platform == "dcard":
+            from src.crawlers.dcard_crawler import DcardCrawler
+            with DcardCrawler(headless=True, use_api=True) as crawler_instance:
+                if cookies and hasattr(crawler_instance, 'scraper'):
+                    crawler_instance.scraper.cookies.update(cookies)
+                return crawler_instance.crawl_post(url)
+
+        # 기본 동작
+        return crawler(url)
+
+    except Exception as e:
+        logger.error(f"크롤링 오류 ({platform}, {url}): {e}")
+        return {
+            "platform": platform,
+            "url": url,
+            "error": str(e),
+            "crawled_at": datetime.now().isoformat(),
+        }
+
+
 def run_crawling():
     """크롤링 실행"""
     urls = st.session_state.get("urls", [])
@@ -329,28 +418,23 @@ def run_crawling():
         progress_bar.progress((i + 1) / total)
 
         try:
-            crawler = get_crawler_for_platform(platform)
-            if crawler:
-                # 크롤링 실행
-                result = crawler(url)
-                results.append(result)
+            # 쿠키를 포함하여 크롤링
+            result = crawl_with_cookies(platform, url)
+            results.append(result)
 
+            # 결과 표시
+            if result.get("error"):
                 with result_container:
-                    st.markdown(f"**{i + 1}. {platform}** - 성공")
-
-                # 플랫폼별 딜레이
-                if platform in ["xiaohongshu", "instagram", "facebook"]:
-                    time.sleep(3)
-                else:
-                    time.sleep(1)
-
+                    st.markdown(f"**{i + 1}. {platform}** - ⚠️ {result.get('error', '')[:30]}")
             else:
-                results.append({
-                    "platform": platform,
-                    "url": url,
-                    "error": f"지원하지 않는 플랫폼: {platform}",
-                    "crawled_at": datetime.now().isoformat(),
-                })
+                with result_container:
+                    st.markdown(f"**{i + 1}. {platform}** - ✅ 성공")
+
+            # 플랫폼별 딜레이
+            if platform in ["xiaohongshu", "instagram", "facebook"]:
+                time.sleep(3)
+            else:
+                time.sleep(1)
 
         except Exception as e:
             logger.error(f"크롤링 오류 ({url}): {e}")
