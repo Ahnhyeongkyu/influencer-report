@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse, parse_qs
 
 import platform
+import requests
 
 # facebook-scraper for API-based crawling
 try:
@@ -109,6 +110,15 @@ class FacebookCrawler:
     MIN_REQUEST_DELAY = 2.0
     MAX_REQUEST_DELAY = 5.0
 
+    # API 헤더
+    API_HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.facebook.com/',
+    }
+
     def __init__(
         self,
         headless: bool = False,
@@ -117,6 +127,7 @@ class FacebookCrawler:
         cookie_file: Optional[str] = None,
         use_mobile: bool = True,
         use_scraper: bool = True,  # facebook-scraper 우선 사용
+        use_api: bool = True,  # requests 기반 API 방식 사용
     ):
         """
         크롤러 초기화
@@ -128,6 +139,7 @@ class FacebookCrawler:
             cookie_file: 쿠키 저장 파일 경로 (None이면 기본 경로 사용)
             use_mobile: 모바일 버전 사용 여부 (True 권장)
             use_scraper: facebook-scraper 라이브러리 사용 여부
+            use_api: requests 기반 API 방식 사용 여부
         """
         self.headless = headless
         self.chrome_driver_path = chrome_driver_path
@@ -135,15 +147,139 @@ class FacebookCrawler:
         self.cookie_file = Path(cookie_file) if cookie_file else self.COOKIE_FILE
         self.use_mobile = use_mobile
         self.use_scraper = use_scraper and HAS_FB_SCRAPER
+        self.use_api = use_api
 
         self.driver: Optional[webdriver.Chrome] = None
         self.is_logged_in = False
         self._last_request_time = 0
+        self.session: Optional[requests.Session] = None
 
         # 쿠키 디렉토리 생성
         self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"FacebookCrawler 초기화 완료 (use_scraper={self.use_scraper})")
+        # requests 세션 초기화
+        if use_api:
+            self._init_session()
+
+        logger.info(f"FacebookCrawler 초기화 완료 (use_api={use_api}, use_scraper={self.use_scraper})")
+
+    def _init_session(self) -> None:
+        """requests 세션 초기화"""
+        self.session = requests.Session()
+        self.session.headers.update(self.API_HEADERS)
+
+    def _crawl_via_api(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        requests를 통한 API 기반 크롤링
+
+        Facebook 페이지의 HTML에서 메타데이터 추출
+
+        Args:
+            url: Facebook 게시물 URL
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        if not self.session:
+            return None
+
+        try:
+            logger.info(f"requests API로 크롤링: {url}")
+
+            # mbasic 버전으로 요청 (가장 가벼운 HTML)
+            mbasic_url = url.replace('www.facebook.com', 'mbasic.facebook.com')
+            mbasic_url = mbasic_url.replace('m.facebook.com', 'mbasic.facebook.com')
+
+            response = self.session.get(mbasic_url, timeout=self.timeout)
+
+            if response.status_code != 200:
+                logger.warning(f"페이지 요청 실패: {response.status_code}")
+                return None
+
+            html = response.text
+
+            # HTML에서 데이터 추출
+            result = self._extract_data_from_html(html, url)
+            return result
+
+        except Exception as e:
+            logger.warning(f"API 크롤링 실패: {e}")
+            return None
+
+    def _extract_data_from_html(self, html: str, url: str) -> Optional[Dict[str, Any]]:
+        """
+        HTML에서 게시물 데이터 추출
+
+        Args:
+            html: 페이지 HTML
+            url: 원본 URL
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        result = {
+            "platform": "facebook",
+            "url": url,
+            "author": None,
+            "content": None,
+            "likes": 0,
+            "comments": 0,
+            "shares": 0,
+            "views": None,
+            "crawled_at": datetime.now().isoformat(),
+        }
+
+        try:
+            # 좋아요 수 추출
+            like_patterns = [
+                r'(\d+(?:,\d+)*)\s*(?:likes?|좋아요)',
+                r'aria-label="(\d+(?:,\d+)*)\s*(?:reactions?|반응)"',
+                r'>(\d+(?:,\d+)*)</span>\s*(?:likes?|좋아요)',
+            ]
+            for pattern in like_patterns:
+                match = re.search(pattern, html, re.IGNORECASE)
+                if match:
+                    result["likes"] = int(match.group(1).replace(',', ''))
+                    break
+
+            # 댓글 수 추출
+            comment_patterns = [
+                r'(\d+(?:,\d+)*)\s*(?:comments?|댓글)',
+                r'>(\d+(?:,\d+)*)</span>\s*(?:comments?|댓글)',
+            ]
+            for pattern in comment_patterns:
+                match = re.search(pattern, html, re.IGNORECASE)
+                if match:
+                    result["comments"] = int(match.group(1).replace(',', ''))
+                    break
+
+            # 공유 수 추출
+            share_patterns = [
+                r'(\d+(?:,\d+)*)\s*(?:shares?|공유)',
+                r'>(\d+(?:,\d+)*)</span>\s*(?:shares?|공유)',
+            ]
+            for pattern in share_patterns:
+                match = re.search(pattern, html, re.IGNORECASE)
+                if match:
+                    result["shares"] = int(match.group(1).replace(',', ''))
+                    break
+
+            # 작성자 추출
+            author_patterns = [
+                r'<strong[^>]*>([^<]+)</strong>',
+                r'class="[^"]*author[^"]*"[^>]*>([^<]+)<',
+            ]
+            for pattern in author_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    result["author"] = match.group(1).strip()
+                    break
+
+            return result if result.get('likes', 0) > 0 or result.get('author') else None
+
+        except Exception as e:
+            logger.debug(f"HTML 데이터 추출 실패: {e}")
+            return None
 
     def _extract_post_id_from_url(self, url: str) -> Optional[str]:
         """
@@ -1069,7 +1205,16 @@ class FacebookCrawler:
         if not url or "facebook.com" not in url:
             raise ValueError(f"유효하지 않은 Facebook URL: {url}")
 
-        # 1. facebook-scraper로 먼저 시도 (Cloud 환경에서 효과적)
+        # 1. API 방식 우선 시도 (쿠키 인증 포함)
+        if self.use_api and self.session:
+            logger.info("requests API로 크롤링 시도...")
+            result = self._crawl_via_api(url)
+            if result and (result.get('likes', 0) > 0 or result.get('author')):
+                logger.info(f"API 크롤링 성공: likes={result.get('likes')}, author={result.get('author')}")
+                return result
+            logger.info("API 방식 실패, facebook-scraper fallback 시도...")
+
+        # 2. facebook-scraper 시도
         if self.use_scraper:
             logger.info("facebook-scraper로 크롤링 시도...")
             result = self._crawl_via_scraper(url)
@@ -1078,7 +1223,7 @@ class FacebookCrawler:
                 return result
             logger.info("facebook-scraper 실패 또는 데이터 없음, Selenium fallback 시도...")
 
-        # 2. Cloud 환경에서 scraper 실패 시 - 기본 결과 반환 (Selenium은 Cloud에서 실패 확률 높음)
+        # 3. Cloud 환경에서 모든 방법 실패 시 - 기본 결과 반환
         if IS_CLOUD:
             logger.warning("Cloud 환경에서 Facebook 크롤링 제한적 - 기본 응답 반환")
             return {
@@ -1094,7 +1239,7 @@ class FacebookCrawler:
                 "error": "cloud_scraping_limited",
             }
 
-        # 3. Selenium fallback (로컬 환경)
+        # 4. Selenium fallback (로컬 환경)
         if self.driver is None:
             self.driver = self._create_driver()
 
