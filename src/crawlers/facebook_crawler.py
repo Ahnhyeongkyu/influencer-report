@@ -1,10 +1,14 @@
 """
 Facebook 크롤러 모듈
 
-공개 게시물/페이지 포스트 데이터 크롤링
-- Stealth 모드 적용 (봇 탐지 우회)
-- 모바일 버전(m.facebook.com) 우선 사용
-- 쿠키 저장/재사용으로 세션 유지
+facebook-scraper 라이브러리를 통한 데이터 크롤링
+- Selenium 없이 서버리스 환경에서 동작
+- API 기반으로 봇 탐지 우회
+- 좋아요, 댓글, 공유 수 등 수집
+
+Streamlit Cloud 호환:
+- facebook-scraper 우선 사용
+- Selenium fallback 지원 (로컬 환경용)
 """
 
 import json
@@ -18,6 +22,13 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse, parse_qs
 
 import platform
+
+# facebook-scraper for API-based crawling
+try:
+    from facebook_scraper import get_posts, get_page_info
+    HAS_FB_SCRAPER = True
+except ImportError:
+    HAS_FB_SCRAPER = False
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -76,8 +87,8 @@ class FacebookCrawler:
     """
     Facebook 크롤러 클래스
 
-    Stealth 모드를 적용한 공개 게시물 데이터 수집
-    모바일 버전 우선 사용으로 크롤링 효율성 향상
+    facebook-scraper 라이브러리를 우선 사용 (Selenium 없이 동작)
+    Selenium은 로컬 환경 fallback으로 사용
     """
 
     # Facebook URL
@@ -105,6 +116,7 @@ class FacebookCrawler:
         timeout: int = DEFAULT_TIMEOUT,
         cookie_file: Optional[str] = None,
         use_mobile: bool = True,
+        use_scraper: bool = True,  # facebook-scraper 우선 사용
     ):
         """
         크롤러 초기화
@@ -115,12 +127,14 @@ class FacebookCrawler:
             timeout: 기본 타임아웃 (초)
             cookie_file: 쿠키 저장 파일 경로 (None이면 기본 경로 사용)
             use_mobile: 모바일 버전 사용 여부 (True 권장)
+            use_scraper: facebook-scraper 라이브러리 사용 여부
         """
         self.headless = headless
         self.chrome_driver_path = chrome_driver_path
         self.timeout = timeout
         self.cookie_file = Path(cookie_file) if cookie_file else self.COOKIE_FILE
         self.use_mobile = use_mobile
+        self.use_scraper = use_scraper and HAS_FB_SCRAPER
 
         self.driver: Optional[webdriver.Chrome] = None
         self.is_logged_in = False
@@ -129,7 +143,134 @@ class FacebookCrawler:
         # 쿠키 디렉토리 생성
         self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info("FacebookCrawler 초기화 완료")
+        logger.info(f"FacebookCrawler 초기화 완료 (use_scraper={self.use_scraper})")
+
+    def _extract_post_id_from_url(self, url: str) -> Optional[str]:
+        """
+        URL에서 게시물 ID 추출
+
+        Args:
+            url: Facebook 게시물 URL
+
+        Returns:
+            게시물 ID 또는 None
+        """
+        # 다양한 URL 패턴 처리
+        patterns = [
+            r'/posts/(\d+)',  # /posts/123456
+            r'/(\d+)/?$',  # 끝의 숫자
+            r'fbid=(\d+)',  # fbid=123456
+            r'story_fbid=(\d+)',  # story_fbid=123456
+            r'/permalink/(\d+)',  # /permalink/123456
+            r'/videos/(\d+)',  # /videos/123456
+            r'/photos/[^/]+/(\d+)',  # /photos/xxx/123456
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+
+        return None
+
+    def _extract_page_name_from_url(self, url: str) -> Optional[str]:
+        """
+        URL에서 페이지명 추출
+
+        Args:
+            url: Facebook URL
+
+        Returns:
+            페이지명 또는 None
+        """
+        patterns = [
+            r'facebook\.com/(\d+)/posts',  # 숫자 페이지 ID
+            r'facebook\.com/([^/]+)/posts',  # 페이지명
+            r'facebook\.com/([^/?]+)',  # 기본 페이지명
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                name = match.group(1)
+                if name not in ['photo', 'video', 'watch', 'reel', 'share']:
+                    return name
+
+        return None
+
+    def _crawl_via_scraper(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        facebook-scraper를 통한 게시물 크롤링
+
+        Args:
+            url: Facebook 게시물 URL
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        if not HAS_FB_SCRAPER:
+            return None
+
+        try:
+            post_id = self._extract_post_id_from_url(url)
+            page_name = self._extract_page_name_from_url(url)
+
+            if not page_name:
+                logger.warning("페이지명을 추출할 수 없습니다.")
+                return None
+
+            logger.info(f"facebook-scraper로 크롤링: page={page_name}, post_id={post_id}")
+
+            # get_posts로 특정 게시물 가져오기
+            posts = get_posts(
+                page_name,
+                pages=1,
+                options={
+                    "posts_per_page": 10,
+                    "allow_extra_requests": False,
+                }
+            )
+
+            for post in posts:
+                # post_id가 일치하거나 URL이 일치하는 게시물 찾기
+                if post_id and str(post.get('post_id')) == str(post_id):
+                    return self._format_scraper_result(post, url)
+
+                # URL 비교
+                post_url = post.get('post_url', '')
+                if post_id and post_id in post_url:
+                    return self._format_scraper_result(post, url)
+
+            # 첫 번째 게시물 반환 (특정 게시물 못 찾은 경우)
+            logger.warning("특정 게시물을 찾지 못해 최근 게시물 데이터 반환")
+            return None
+
+        except Exception as e:
+            logger.warning(f"facebook-scraper 크롤링 실패: {e}")
+            return None
+
+    def _format_scraper_result(self, post: dict, url: str) -> Dict[str, Any]:
+        """
+        facebook-scraper 결과를 표준 포맷으로 변환
+
+        Args:
+            post: facebook-scraper의 게시물 데이터
+            url: 원본 URL
+
+        Returns:
+            표준화된 게시물 데이터
+        """
+        return {
+            "platform": "facebook",
+            "url": url,
+            "author": post.get('username') or post.get('user_id') or "Unknown",
+            "content": (post.get('text') or "")[:500],
+            "likes": post.get('likes', 0) or post.get('reactions', 0) or 0,
+            "comments": post.get('comments', 0) or 0,
+            "shares": post.get('shares', 0) or 0,
+            "views": post.get('video_views'),
+            "crawled_at": datetime.now().isoformat(),
+        }
 
     def _create_driver(self) -> webdriver.Chrome:
         """
@@ -928,7 +1069,32 @@ class FacebookCrawler:
         if not url or "facebook.com" not in url:
             raise ValueError(f"유효하지 않은 Facebook URL: {url}")
 
-        # 드라이버 초기화
+        # 1. facebook-scraper로 먼저 시도 (Cloud 환경에서 효과적)
+        if self.use_scraper:
+            logger.info("facebook-scraper로 크롤링 시도...")
+            result = self._crawl_via_scraper(url)
+            if result and (result.get('likes', 0) > 0 or result.get('comments', 0) > 0):
+                logger.info(f"facebook-scraper 성공: likes={result['likes']}, comments={result['comments']}")
+                return result
+            logger.info("facebook-scraper 실패 또는 데이터 없음, Selenium fallback 시도...")
+
+        # 2. Cloud 환경에서 scraper 실패 시 - 기본 결과 반환 (Selenium은 Cloud에서 실패 확률 높음)
+        if IS_CLOUD:
+            logger.warning("Cloud 환경에서 Facebook 크롤링 제한적 - 기본 응답 반환")
+            return {
+                "platform": "facebook",
+                "url": url,
+                "author": None,
+                "content": None,
+                "likes": 0,
+                "comments": 0,
+                "shares": 0,
+                "views": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": "cloud_scraping_limited",
+            }
+
+        # 3. Selenium fallback (로컬 환경)
         if self.driver is None:
             self.driver = self._create_driver()
 

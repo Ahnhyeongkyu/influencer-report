@@ -1,18 +1,14 @@
 """
 Dcard (대만 커뮤니티 플랫폼) 크롤러 모듈
 
-undetected-chromedriver를 활용한 게시물 데이터 수집
-- Cloudflare 보호 우회 (GUI 모드 권장)
+API 기반 크롤링 (Cloudflare 우회)
+- cloudscraper를 사용한 Dcard API v2 직접 호출
+- Selenium 없이 서버리스 환경에서 동작
 - 좋아요, 댓글 수 등 수집
-- 로그인 없이 공개 게시물 접근
 
-주의: Dcard는 Cloudflare 보호가 매우 강력합니다.
-- headless 모드: 차단될 가능성 높음
-- GUI 모드: 수동 Cloudflare 인증 후 작동 가능
-- 세션 쿠키 저장/재사용으로 반복 인증 방지
-
-Streamlit Cloud:
-- undetected-chromedriver 사용 불가 시 일반 Selenium 사용
+Streamlit Cloud 호환:
+- cloudscraper + API 방식으로 Cloudflare 우회
+- Selenium fallback 지원 (로컬 환경용)
 """
 
 import json
@@ -25,6 +21,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
+
+# cloudscraper for Cloudflare bypass
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
 
 # Streamlit Cloud 환경 감지
 IS_CLOUD = platform.system() == "Linux" and os.path.exists("/etc/debian_version")
@@ -68,17 +71,21 @@ class DcardCrawler:
     """
     Dcard 크롤러 클래스
 
-    undetected-chromedriver를 사용하여 게시물 데이터 수집
-    Cloudflare 보호 우회 시도
+    cloudscraper를 사용한 API 기반 크롤링 (Cloudflare 우회)
+    Selenium은 로컬 환경 fallback으로 사용
 
-    권장 사용법:
-    1. headless=False로 브라우저 GUI 모드 사용
-    2. 첫 접속 시 수동으로 Cloudflare 인증 완료
-    3. 쿠키가 저장되어 이후 자동 인증
+    Cloud 환경:
+    - cloudscraper + Dcard API v2 사용
+    - Selenium 없이 동작
+
+    로컬 환경:
+    - cloudscraper 우선 시도
+    - 실패 시 Selenium fallback
     """
 
     # 기본 URL
     BASE_URL = "https://www.dcard.tw"
+    API_URL = "https://www.dcard.tw/service/api/v2/posts"
 
     # 기본 설정
     DEFAULT_TIMEOUT = 30
@@ -94,30 +101,107 @@ class DcardCrawler:
         headless: bool = False,  # GUI 모드 권장
         timeout: int = DEFAULT_TIMEOUT,
         cookie_file: Optional[str] = None,
+        use_api: bool = True,  # API 방식 우선 사용
     ):
         """
         크롤러 초기화
 
         Args:
-            headless: 헤드리스 모드 (False 권장 - Cloudflare 우회 위해)
+            headless: 헤드리스 모드 (Selenium 사용 시)
             timeout: 기본 타임아웃 (초)
             cookie_file: 쿠키 저장 파일 경로
+            use_api: API 방식 우선 사용 여부
         """
         self.headless = headless
         self.timeout = timeout
         self.cookie_file = Path(cookie_file) if cookie_file else self.COOKIE_FILE
+        self.use_api = use_api
 
         self.driver = None
+        self.scraper = None  # cloudscraper 인스턴스
 
         # 쿠키 디렉토리 생성
         self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"DcardCrawler 초기화 완료 (headless={headless})")
-        if headless:
-            logger.warning(
-                "headless 모드는 Cloudflare에 의해 차단될 수 있습니다. "
-                "GUI 모드(headless=False)를 권장합니다."
+        # cloudscraper 초기화
+        if HAS_CLOUDSCRAPER and use_api:
+            self._init_scraper()
+
+        logger.info(f"DcardCrawler 초기화 완료 (use_api={use_api}, headless={headless})")
+
+    def _init_scraper(self) -> None:
+        """cloudscraper 인스턴스 초기화"""
+        try:
+            self.scraper = cloudscraper.create_scraper(
+                browser={
+                    'browser': 'chrome',
+                    'platform': 'windows',
+                    'desktop': True,
+                },
+                delay=10,
             )
+            # 헤더 설정
+            self.scraper.headers.update({
+                'Accept': 'application/json',
+                'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+                'Referer': 'https://www.dcard.tw/',
+                'Origin': 'https://www.dcard.tw',
+            })
+            logger.info("cloudscraper 초기화 완료")
+        except Exception as e:
+            logger.warning(f"cloudscraper 초기화 실패: {e}")
+            self.scraper = None
+
+    def _crawl_via_api(self, post_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Dcard API를 통한 게시물 데이터 크롤링
+
+        Args:
+            post_id: 게시물 ID
+
+        Returns:
+            게시물 데이터 또는 None (실패 시)
+        """
+        if not self.scraper:
+            return None
+
+        try:
+            # API 엔드포인트
+            api_url = f"{self.API_URL}/{post_id}"
+            logger.info(f"Dcard API 호출: {api_url}")
+
+            response = self.scraper.get(api_url, timeout=self.timeout)
+
+            if response.status_code == 200:
+                data = response.json()
+                result = {
+                    "platform": "dcard",
+                    "url": f"{self.BASE_URL}/f/{data.get('forumAlias', 'all')}/p/{post_id}",
+                    "post_id": str(post_id),
+                    "author": data.get("school") or "Anonymous",
+                    "title": data.get("title", ""),
+                    "likes": data.get("likeCount", 0) or 0,
+                    "comments": data.get("commentCount", 0) or 0,
+                    "shares": data.get("shareCount"),
+                    "views": data.get("viewCount"),
+                    "forum": data.get("forumAlias", ""),
+                    "created_at": data.get("createdAt", ""),
+                    "crawled_at": datetime.now().isoformat(),
+                }
+                logger.info(f"API 크롤링 성공: likes={result['likes']}, comments={result['comments']}")
+                return result
+            elif response.status_code == 404:
+                logger.error(f"게시물을 찾을 수 없음: {post_id}")
+                raise DcardPostNotFoundError(f"게시물 ID {post_id}를 찾을 수 없습니다.")
+            else:
+                logger.warning(f"API 응답 오류: {response.status_code}")
+                return None
+
+        except DcardPostNotFoundError:
+            raise
+        except Exception as e:
+            logger.warning(f"API 크롤링 실패: {e}")
+            return None
 
     def _create_driver(self):
         """
@@ -563,13 +647,32 @@ class DcardCrawler:
         if not url:
             raise ValueError("URL이 비어있습니다")
 
-        # 숫자만 입력된 경우 URL 생성
+        # 게시물 ID 추출
+        post_id = None
         if url.isdigit():
+            post_id = url
             url = f"{self.BASE_URL}/f/all/p/{url}"
         elif "dcard.tw" not in url:
             raise ValueError(f"유효하지 않은 Dcard URL: {url}")
+        else:
+            post_id = self._extract_post_id(url)
 
-        # 드라이버 초기화
+        # 1. API 방식 우선 시도 (Cloud 환경에서 효과적)
+        if self.use_api and self.scraper and post_id:
+            logger.info("API 방식으로 크롤링 시도...")
+            result = self._crawl_via_api(post_id)
+            if result:
+                return result
+            logger.info("API 방식 실패, Selenium fallback 시도...")
+
+        # 2. Cloud 환경에서 API 실패 시 에러 (Selenium은 Cloud에서 Cloudflare 우회 불가)
+        if IS_CLOUD and not (self.use_api and self.scraper):
+            raise DcardCloudflareError(
+                "Cloud 환경에서는 cloudscraper + API 방식만 지원됩니다. "
+                "cloudscraper 라이브러리가 설치되어 있는지 확인하세요."
+            )
+
+        # 3. Selenium fallback (로컬 환경)
         if self.driver is None:
             self.driver = self._create_driver()
 
