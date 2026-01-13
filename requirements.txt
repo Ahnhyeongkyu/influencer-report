@@ -1,0 +1,35 @@
+# 멀티플랫폼 인플루언서 캠페인 성과 리포트 시스템
+# Python 3.10
+# Streamlit Cloud 호환
+
+# === 웹 크롤링 ===
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+seleniumbase>=4.23.0
+
+# === 웹 UI ===
+streamlit>=1.28.0
+
+# === 데이터 처리 ===
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+
+# === 시각화 ===
+matplotlib>=3.7.0
+plotly>=5.18.0
+
+# === PDF 생성 ===
+reportlab>=4.0.0
+jinja2>=3.1.0
+
+# === 환경 변수 ===
+python-dotenv>=1.0.0
+
+# === 유틸리티 ===
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# === YouTube 크롤링 ===
+yt-dlp>=2024.1.0

@@ -1,0 +1,240 @@
+"""
+인증 모듈
+
+Streamlit 앱을 위한 간단한 세션 기반 인증
+"""
+
+import os
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
+
+import streamlit as st
+
+logger = logging.getLogger(__name__)
+
+# 환경 변수에서 인증 정보 로드
+DEFAULT_USERNAME = "admin"
+DEFAULT_PASSWORD = "your_secure_password"
+
+
+def get_credentials() -> Tuple[str, str]:
+    """
+    환경 변수에서 인증 정보 로드
+
+    Returns:
+        (username, password)
+    """
+    username = os.getenv("APP_USERNAME", DEFAULT_USERNAME)
+    password = os.getenv("APP_PASSWORD", DEFAULT_PASSWORD)
+    return username, password
+
+
+def hash_password(password: str) -> str:
+    """
+    비밀번호 해시 생성
+
+    Args:
+        password: 원본 비밀번호
+
+    Returns:
+        해시된 비밀번호
+    """
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_credentials(username: str, password: str) -> bool:
+    """
+    사용자 인증 확인
+
+    Args:
+        username: 입력된 사용자명
+        password: 입력된 비밀번호
+
+    Returns:
+        인증 성공 여부
+    """
+    valid_username, valid_password = get_credentials()
+
+    if username == valid_username and password == valid_password:
+        return True
+
+    return False
+
+
+def init_session_state():
+    """
+    세션 상태 초기화
+    """
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if "username" not in st.session_state:
+        st.session_state.username = None
+
+    if "login_time" not in st.session_state:
+        st.session_state.login_time = None
+
+
+def check_session_timeout(timeout_minutes: int = 60) -> bool:
+    """
+    세션 만료 확인
+
+    Args:
+        timeout_minutes: 세션 타임아웃 (분)
+
+    Returns:
+        세션 유효 여부
+    """
+    if not st.session_state.get("login_time"):
+        return False
+
+    login_time = st.session_state.login_time
+    if datetime.now() - login_time > timedelta(minutes=timeout_minutes):
+        # 세션 만료
+        logout()
+        return False
+
+    return True
+
+
+def login(username: str, password: str) -> bool:
+    """
+    로그인 처리
+
+    Args:
+        username: 사용자명
+        password: 비밀번호
+
+    Returns:
+        로그인 성공 여부
+    """
+    if verify_credentials(username, password):
+        st.session_state.authenticated = True
+        st.session_state.username = username
+        st.session_state.login_time = datetime.now()
+        logger.info(f"로그인 성공: {username}")
+        return True
+    else:
+        logger.warning(f"로그인 실패: {username}")
+        return False
+
+
+def logout():
+    """
+    로그아웃 처리
+    """
+    st.session_state.authenticated = False
+    st.session_state.username = None
+    st.session_state.login_time = None
+    logger.info("로그아웃")
+
+
+def is_authenticated() -> bool:
+    """
+    인증 상태 확인
+
+    Returns:
+        인증 여부
+    """
+    init_session_state()
+
+    if not st.session_state.authenticated:
+        return False
+
+    # 세션 타임아웃 확인
+    if not check_session_timeout():
+        return False
+
+    return True
+
+
+def show_login_form():
+    """
+    로그인 폼 표시
+    """
+    st.markdown(
+        """
+        <style>
+        .login-container {
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        st.markdown("### 로그인")
+        st.markdown("---")
+
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input(
+                "사용자명",
+                placeholder="사용자명을 입력하세요",
+            )
+            password = st.text_input(
+                "비밀번호",
+                type="password",
+                placeholder="비밀번호를 입력하세요",
+            )
+
+            submitted = st.form_submit_button(
+                "로그인",
+                use_container_width=True,
+                type="primary",
+            )
+
+            if submitted:
+                if username and password:
+                    if login(username, password):
+                        st.success("로그인 성공!")
+                        st.rerun()
+                    else:
+                        st.error("사용자명 또는 비밀번호가 올바르지 않습니다.")
+                else:
+                    st.warning("사용자명과 비밀번호를 입력하세요.")
+
+
+def show_user_info():
+    """
+    사용자 정보 및 로그아웃 버튼 표시
+    """
+    if is_authenticated():
+        with st.sidebar:
+            st.markdown("---")
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.markdown(f"**{st.session_state.username}**님 로그인")
+            with col2:
+                if st.button("로그아웃", use_container_width=True):
+                    logout()
+                    st.rerun()
+
+
+def require_auth(func):
+    """
+    인증 필요 데코레이터
+
+    사용법:
+        @require_auth
+        def my_page():
+            st.write("인증된 사용자만 볼 수 있습니다")
+
+    Args:
+        func: 래핑할 함수
+
+    Returns:
+        래핑된 함수
+    """
+    def wrapper(*args, **kwargs):
+        if not is_authenticated():
+            show_login_form()
+            return None
+        return func(*args, **kwargs)
+    return wrapper

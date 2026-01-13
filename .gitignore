@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Project specific
+data/
+logs/
+*.png
+*.html
+*.json
+*.txt
+!packages.txt
+!requirements.txt
+
+# Claude
+.claude/
+
+# Temp
+*.bak
+nul
