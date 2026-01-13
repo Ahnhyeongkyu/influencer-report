@@ -9,8 +9,6 @@ from pathlib import Path
 src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
-# 메인 앱 임포트 및 실행
+# 메인 앱 임포트 및 실행 (Streamlit은 __name__ 체크 없이 직접 실행)
 from app import main
-
-if __name__ == "__main__":
-    main()
+main()
