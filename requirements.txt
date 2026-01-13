@@ -34,9 +34,6 @@ lxml>=4.9.0
 # === YouTube 크롤링 ===
 yt-dlp>=2024.1.0
 
-# === Facebook 크롤링 (Selenium 대안) ===
-facebook-scraper>=0.2.60
-
 # === Dcard 크롤링 (Cloudflare 우회) ===
 cloudscraper>=1.2.71
 
