@@ -1,10 +1,14 @@
 """
 인스타그램(Instagram) 크롤러 모듈
 
-공개 게시물 데이터 크롤링 (로그인 없이 시도 -> 필요시 로그인)
+requests 기반 API 크롤링 + Selenium fallback
+- Instagram GraphQL API를 통한 데이터 수집
+- Selenium 없이 서버리스 환경에서 동작
 - 좋아요, 댓글, 조회수, 작성자, 캡션 수집
-- 봇 탐지 우회를 위한 Stealth 모드 적용
-- 쿠키 저장/재사용으로 세션 유지
+
+Streamlit Cloud 호환:
+- requests + GraphQL API 우선 사용
+- Selenium fallback 지원 (로컬 환경용)
 """
 
 import json
@@ -19,6 +23,14 @@ from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 
 import platform
+import requests
+
+# httpx for better async support (optional)
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -77,9 +89,8 @@ class InstagramCrawler:
     """
     인스타그램 크롤러 클래스
 
-    공개 게시물 데이터 수집 (비로그인 우선, 필요시 로그인)
-    Stealth 모드를 통한 봇 탐지 우회
-    쿠키 저장/로드를 통한 세션 재사용 지원
+    requests 기반 API 크롤링을 우선 사용 (Selenium 없이 동작)
+    실패 시 Selenium fallback으로 전환
     """
 
     # 인스타그램 기본 URL
@@ -98,6 +109,16 @@ class InstagramCrawler:
     MIN_REQUEST_DELAY = 3.0
     MAX_REQUEST_DELAY = 7.0
 
+    # Instagram API 헤더
+    API_HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.instagram.com/',
+        'X-IG-App-ID': '936619743392459',  # Instagram Web App ID
+    }
+
     def __init__(
         self,
         headless: bool = False,
@@ -106,6 +127,7 @@ class InstagramCrawler:
         cookie_file: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        use_api: bool = True,  # API 방식 우선 사용
     ):
         """
         크롤러 초기화
@@ -117,6 +139,7 @@ class InstagramCrawler:
             cookie_file: 쿠키 저장 파일 경로 (None이면 기본 경로 사용)
             username: 인스타그램 사용자명 (로그인 필요시)
             password: 인스타그램 비밀번호 (로그인 필요시)
+            use_api: requests 기반 API 방식 우선 사용 여부
         """
         self.headless = headless
         self.chrome_driver_path = chrome_driver_path
@@ -124,14 +147,255 @@ class InstagramCrawler:
         self.cookie_file = Path(cookie_file) if cookie_file else self.COOKIE_FILE
         self.username = username or os.getenv("INSTAGRAM_USERNAME")
         self.password = password or os.getenv("INSTAGRAM_PASSWORD")
+        self.use_api = use_api
 
         self.driver: Optional[webdriver.Chrome] = None
         self.is_logged_in = False
+        self.session: Optional[requests.Session] = None
 
         # 쿠키 디렉토리 생성
         self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info("InstagramCrawler 초기화 완료")
+        # requests 세션 초기화
+        if use_api:
+            self._init_session()
+
+        logger.info(f"InstagramCrawler 초기화 완료 (use_api={use_api})")
+
+    def _init_session(self) -> None:
+        """requests 세션 초기화"""
+        self.session = requests.Session()
+        self.session.headers.update(self.API_HEADERS)
+
+    def _crawl_via_api(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        requests를 통한 API 기반 크롤링
+
+        Instagram 페이지의 HTML에서 embedded JSON 데이터 추출
+
+        Args:
+            url: Instagram 게시물 URL
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        if not self.session:
+            return None
+
+        try:
+            shortcode = self._extract_shortcode_from_url(url)
+            if not shortcode:
+                logger.warning("shortcode를 추출할 수 없습니다.")
+                return None
+
+            logger.info(f"requests API로 크롤링: shortcode={shortcode}")
+
+            # 페이지 HTML 요청
+            page_url = f"{self.BASE_URL}/p/{shortcode}/"
+            response = self.session.get(page_url, timeout=self.timeout)
+
+            if response.status_code != 200:
+                logger.warning(f"페이지 요청 실패: {response.status_code}")
+                return None
+
+            html = response.text
+
+            # 1. script 태그에서 JSON 데이터 추출 시도
+            result = self._extract_data_from_html(html, url, shortcode)
+            if result and (result.get('likes', 0) > 0 or result.get('author')):
+                return result
+
+            # 2. GraphQL API 직접 호출 시도
+            result = self._fetch_via_graphql(shortcode, url)
+            if result:
+                return result
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"API 크롤링 실패: {e}")
+            return None
+
+    def _extract_data_from_html(self, html: str, url: str, shortcode: str) -> Optional[Dict[str, Any]]:
+        """
+        HTML에서 embedded JSON 데이터 추출
+
+        Args:
+            html: 페이지 HTML
+            url: 원본 URL
+            shortcode: 게시물 shortcode
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        result = {
+            "platform": "instagram",
+            "url": url,
+            "shortcode": shortcode,
+            "author": None,
+            "caption": None,
+            "likes": 0,
+            "comments": 0,
+            "views": None,
+            "crawled_at": datetime.now().isoformat(),
+        }
+
+        try:
+            # 방법 1: window._sharedData에서 추출
+            shared_data_match = re.search(r'window\._sharedData\s*=\s*({.+?});</script>', html)
+            if shared_data_match:
+                data = json.loads(shared_data_match.group(1))
+                media = self._find_media_in_shared_data(data)
+                if media:
+                    self._populate_result_from_media(result, media)
+                    if result.get('likes', 0) > 0 or result.get('author'):
+                        return result
+
+            # 방법 2: __additionalDataLoaded에서 추출
+            additional_match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);</script>', html)
+            if additional_match:
+                data = json.loads(additional_match.group(1))
+                media = self._find_media_in_additional_data(data)
+                if media:
+                    self._populate_result_from_media(result, media)
+                    if result.get('likes', 0) > 0 or result.get('author'):
+                        return result
+
+            # 방법 3: 정규식으로 직접 추출
+            patterns = {
+                'likes': [
+                    r'"edge_media_preview_like"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                    r'"like_count"\s*:\s*(\d+)',
+                    r'"edge_liked_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                ],
+                'comments': [
+                    r'"edge_media_preview_comment"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                    r'"comment_count"\s*:\s*(\d+)',
+                    r'"edge_media_to_comment"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                ],
+                'views': [
+                    r'"video_view_count"\s*:\s*(\d+)',
+                    r'"view_count"\s*:\s*(\d+)',
+                ],
+                'author': [
+                    r'"username"\s*:\s*"([^"]+)"',
+                    r'"owner"\s*:\s*\{[^}]*"username"\s*:\s*"([^"]+)"',
+                ],
+            }
+
+            for key, pattern_list in patterns.items():
+                for pattern in pattern_list:
+                    match = re.search(pattern, html)
+                    if match:
+                        value = match.group(1)
+                        if key in ['likes', 'comments', 'views']:
+                            result[key] = int(value)
+                        else:
+                            result[key] = value
+                        break
+
+            return result if result.get('likes', 0) > 0 or result.get('author') else None
+
+        except Exception as e:
+            logger.debug(f"HTML 데이터 추출 실패: {e}")
+            return None
+
+    def _find_media_in_shared_data(self, data: dict) -> Optional[dict]:
+        """sharedData에서 미디어 데이터 찾기"""
+        try:
+            return data.get('entry_data', {}).get('PostPage', [{}])[0].get('graphql', {}).get('shortcode_media')
+        except (KeyError, IndexError):
+            return None
+
+    def _find_media_in_additional_data(self, data: dict) -> Optional[dict]:
+        """additionalData에서 미디어 데이터 찾기"""
+        try:
+            return data.get('graphql', {}).get('shortcode_media') or data.get('shortcode_media')
+        except (KeyError, TypeError):
+            return None
+
+    def _populate_result_from_media(self, result: dict, media: dict) -> None:
+        """미디어 데이터로 결과 채우기"""
+        try:
+            # 좋아요 수
+            if 'edge_media_preview_like' in media:
+                result['likes'] = media['edge_media_preview_like'].get('count', 0)
+            elif 'edge_liked_by' in media:
+                result['likes'] = media['edge_liked_by'].get('count', 0)
+
+            # 댓글 수
+            if 'edge_media_preview_comment' in media:
+                result['comments'] = media['edge_media_preview_comment'].get('count', 0)
+            elif 'edge_media_to_comment' in media:
+                result['comments'] = media['edge_media_to_comment'].get('count', 0)
+
+            # 조회수 (동영상)
+            result['views'] = media.get('video_view_count')
+
+            # 작성자
+            owner = media.get('owner', {})
+            result['author'] = owner.get('username')
+
+            # 캡션
+            edges = media.get('edge_media_to_caption', {}).get('edges', [])
+            if edges:
+                result['caption'] = edges[0].get('node', {}).get('text', '')[:500]
+
+        except Exception as e:
+            logger.debug(f"미디어 데이터 파싱 실패: {e}")
+
+    def _fetch_via_graphql(self, shortcode: str, url: str) -> Optional[Dict[str, Any]]:
+        """
+        GraphQL API로 직접 데이터 가져오기
+
+        Args:
+            shortcode: 게시물 shortcode
+            url: 원본 URL
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        try:
+            # GraphQL 쿼리 (Instagram public API)
+            query_hash = "b3055c01b4b222b8a47dc12b090e4e64"  # media query hash
+            variables = json.dumps({
+                "shortcode": shortcode,
+                "child_comment_count": 3,
+                "fetch_comment_count": 40,
+                "parent_comment_count": 24,
+                "has_threaded_comments": True
+            })
+
+            api_url = f"{self.BASE_URL}/graphql/query/"
+            params = {
+                "query_hash": query_hash,
+                "variables": variables
+            }
+
+            response = self.session.get(api_url, params=params, timeout=self.timeout)
+
+            if response.status_code == 200:
+                data = response.json()
+                media = data.get('data', {}).get('shortcode_media')
+                if media:
+                    result = {
+                        "platform": "instagram",
+                        "url": url,
+                        "shortcode": shortcode,
+                        "author": None,
+                        "caption": None,
+                        "likes": 0,
+                        "comments": 0,
+                        "views": None,
+                        "crawled_at": datetime.now().isoformat(),
+                    }
+                    self._populate_result_from_media(result, media)
+                    return result
+
+        except Exception as e:
+            logger.debug(f"GraphQL API 호출 실패: {e}")
+
+        return None
 
     def _random_delay(self, min_delay: float = None, max_delay: float = None) -> None:
         """
@@ -950,7 +1214,31 @@ class InstagramCrawler:
         if not url or "instagram.com" not in url:
             raise ValueError(f"유효하지 않은 인스타그램 URL: {url}")
 
-        # 드라이버 초기화
+        # 1. API 방식 우선 시도 (Cloud 환경에서 효과적)
+        if self.use_api and self.session:
+            logger.info("requests API로 크롤링 시도...")
+            result = self._crawl_via_api(url)
+            if result and (result.get('likes', 0) > 0 or result.get('author')):
+                logger.info(f"API 크롤링 성공: likes={result.get('likes')}, author={result.get('author')}")
+                return result
+            logger.info("API 방식 실패, Selenium fallback 시도...")
+
+        # 2. Cloud 환경에서 API 실패 시 - 제한적 응답 반환
+        if IS_CLOUD:
+            logger.warning("Cloud 환경에서 Instagram 크롤링 제한적")
+            return {
+                "platform": "instagram",
+                "url": url,
+                "author": None,
+                "caption": None,
+                "likes": 0,
+                "comments": 0,
+                "views": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": "cloud_scraping_limited",
+            }
+
+        # 3. Selenium fallback (로컬 환경)
         if self.driver is None:
             self.driver = self._create_driver()
 

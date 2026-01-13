@@ -1,9 +1,15 @@
 """
 샤오홍슈(小红书/RED) 크롤러 모듈
 
-QR 코드 인증 기반 로그인 및 게시물 데이터 크롤링
+requests 기반 API 크롤링 + Selenium fallback
+- 비로그인 상태에서도 공개 게시물 데이터 수집 시도
 - 좋아요, 즐겨찾기, 댓글, 공유, 조회수 수집
 - 쿠키 저장/재사용으로 세션 유지
+
+Streamlit Cloud 호환:
+- requests 기반 HTML 파싱 우선 시도
+- 실패 시 로컬 환경에서만 Selenium 사용
+- QR 인증은 로컬 환경에서만 지원
 """
 
 import json
@@ -13,9 +19,10 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import platform
+import requests
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -68,8 +75,8 @@ class XHSCrawler:
     """
     샤오홍슈 크롤러 클래스
 
-    QR 코드 인증을 통한 로그인 후 게시물 데이터 수집
-    쿠키 저장/로드를 통한 세션 재사용 지원
+    requests 기반 API 크롤링을 우선 사용 (Selenium 없이 동작)
+    실패 시 Selenium fallback으로 전환 (로컬 환경에서만)
     """
 
     # 샤오홍슈 기본 URL
@@ -85,12 +92,22 @@ class XHSCrawler:
     COOKIE_DIR = Path(__file__).parent.parent.parent / "data" / "cookies"
     COOKIE_FILE = COOKIE_DIR / "xhs_cookies.json"
 
+    # API 헤더
+    API_HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.xiaohongshu.com/',
+    }
+
     def __init__(
         self,
         headless: bool = False,
         chrome_driver_path: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
         cookie_file: Optional[str] = None,
+        use_api: bool = True,  # API 방식 우선 사용
     ):
         """
         크롤러 초기화
@@ -100,19 +117,199 @@ class XHSCrawler:
             chrome_driver_path: ChromeDriver 경로 (None이면 자동 탐색)
             timeout: 기본 타임아웃 (초)
             cookie_file: 쿠키 저장 파일 경로 (None이면 기본 경로 사용)
+            use_api: requests 기반 API 방식 우선 사용 여부
         """
         self.headless = headless
         self.chrome_driver_path = chrome_driver_path
         self.timeout = timeout
         self.cookie_file = Path(cookie_file) if cookie_file else self.COOKIE_FILE
+        self.use_api = use_api
 
         self.driver: Optional[webdriver.Chrome] = None
         self.is_logged_in = False
+        self.session: Optional[requests.Session] = None
 
         # 쿠키 디렉토리 생성
         self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info("XHSCrawler 초기화 완료")
+        # requests 세션 초기화
+        if use_api:
+            self._init_session()
+
+        logger.info(f"XHSCrawler 초기화 완료 (use_api={use_api})")
+
+    def _init_session(self) -> None:
+        """requests 세션 초기화"""
+        self.session = requests.Session()
+        self.session.headers.update(self.API_HEADERS)
+
+    def _extract_note_id(self, url: str) -> Optional[str]:
+        """
+        URL에서 노트 ID 추출
+
+        Args:
+            url: 샤오홍슈 게시물 URL
+
+        Returns:
+            노트 ID 또는 None
+        """
+        # /explore/xxxxx 형식
+        match = re.search(r'/explore/([a-zA-Z0-9]+)', url)
+        if match:
+            return match.group(1)
+
+        # /discovery/item/xxxxx 형식
+        match = re.search(r'/discovery/item/([a-zA-Z0-9]+)', url)
+        if match:
+            return match.group(1)
+
+        # 단축 URL에서 ID 추출
+        match = re.search(r'xhslink\.com/([a-zA-Z0-9]+)', url)
+        if match:
+            return match.group(1)
+
+        return None
+
+    def _crawl_via_api(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        requests를 통한 API 기반 크롤링
+
+        Args:
+            url: 샤오홍슈 게시물 URL
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        if not self.session:
+            return None
+
+        try:
+            note_id = self._extract_note_id(url)
+            if not note_id:
+                logger.warning("노트 ID를 추출할 수 없습니다.")
+                return None
+
+            logger.info(f"requests API로 크롤링: note_id={note_id}")
+
+            # 페이지 HTML 요청
+            page_url = f"{self.BASE_URL}/explore/{note_id}"
+            response = self.session.get(page_url, timeout=self.timeout)
+
+            if response.status_code != 200:
+                logger.warning(f"페이지 요청 실패: {response.status_code}")
+                return None
+
+            html = response.text
+
+            # HTML에서 데이터 추출
+            result = self._extract_data_from_html(html, url, note_id)
+            if result and (result.get('likes', 0) > 0 or result.get('author')):
+                return result
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"API 크롤링 실패: {e}")
+            return None
+
+    def _extract_data_from_html(self, html: str, url: str, note_id: str) -> Optional[Dict[str, Any]]:
+        """
+        HTML에서 게시물 데이터 추출
+
+        Args:
+            html: 페이지 HTML
+            url: 원본 URL
+            note_id: 노트 ID
+
+        Returns:
+            게시물 데이터 또는 None
+        """
+        result = {
+            "platform": "xiaohongshu",
+            "url": url,
+            "note_id": note_id,
+            "author": None,
+            "author_id": None,
+            "title": None,
+            "likes": 0,
+            "favorites": 0,
+            "comments": 0,
+            "shares": 0,
+            "views": None,
+            "crawled_at": datetime.now().isoformat(),
+        }
+
+        try:
+            # __INITIAL_STATE__ 또는 유사한 JSON 데이터 추출
+            state_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.+?})</script>', html, re.DOTALL)
+            if state_match:
+                try:
+                    # JSON 파싱 시도
+                    state_text = state_match.group(1)
+                    # undefined를 null로 변환
+                    state_text = re.sub(r'\bundefined\b', 'null', state_text)
+                    data = json.loads(state_text)
+
+                    note_data = data.get('note', {}).get('note', {})
+                    if note_data:
+                        result['title'] = note_data.get('title', '')
+                        result['likes'] = note_data.get('likedCount', 0) or 0
+                        result['favorites'] = note_data.get('collectedCount', 0) or 0
+                        result['comments'] = note_data.get('commentCount', 0) or 0
+                        result['shares'] = note_data.get('shareCount', 0) or 0
+
+                        user = note_data.get('user', {})
+                        result['author'] = user.get('nickname')
+                        result['author_id'] = user.get('userId')
+
+                        if result.get('likes', 0) > 0 or result.get('author'):
+                            logger.info(f"__INITIAL_STATE__에서 데이터 추출 성공")
+                            return result
+                except json.JSONDecodeError:
+                    pass
+
+            # 정규식으로 직접 추출 시도
+            patterns = {
+                'likes': [
+                    r'"likedCount"\s*:\s*(\d+)',
+                    r'"liked_count"\s*:\s*(\d+)',
+                ],
+                'favorites': [
+                    r'"collectedCount"\s*:\s*(\d+)',
+                    r'"collected_count"\s*:\s*(\d+)',
+                ],
+                'comments': [
+                    r'"commentCount"\s*:\s*(\d+)',
+                    r'"comment_count"\s*:\s*(\d+)',
+                ],
+                'shares': [
+                    r'"shareCount"\s*:\s*(\d+)',
+                    r'"share_count"\s*:\s*(\d+)',
+                ],
+                'author': [
+                    r'"nickname"\s*:\s*"([^"]+)"',
+                ],
+                'title': [
+                    r'"title"\s*:\s*"([^"]+)"',
+                ],
+            }
+
+            for key, pattern_list in patterns.items():
+                for pattern in pattern_list:
+                    match = re.search(pattern, html)
+                    if match:
+                        value = match.group(1)
+                        if key in ['likes', 'favorites', 'comments', 'shares']:
+                            result[key] = int(value)
+                        else:
+                            result[key] = value
+                        break
+
+            return result if result.get('likes', 0) > 0 or result.get('favorites', 0) > 0 or result.get('author') else None
+
+        except Exception as e:
+            logger.debug(f"HTML 데이터 추출 실패: {e}")
+            return None
 
     def _create_driver(self) -> webdriver.Chrome:
         """
@@ -705,7 +902,33 @@ class XHSCrawler:
         if not url or "xiaohongshu.com" not in url and "xhslink.com" not in url:
             raise ValueError(f"유효하지 않은 샤오홍슈 URL: {url}")
 
-        # 드라이버 초기화
+        # 1. API 방식 우선 시도 (Cloud 환경에서 효과적)
+        if self.use_api and self.session:
+            logger.info("requests API로 크롤링 시도...")
+            result = self._crawl_via_api(url)
+            if result and (result.get('likes', 0) > 0 or result.get('favorites', 0) > 0 or result.get('author')):
+                logger.info(f"API 크롤링 성공: likes={result.get('likes')}, favorites={result.get('favorites')}")
+                return result
+            logger.info("API 방식 실패, Selenium fallback 시도...")
+
+        # 2. Cloud 환경에서 API 실패 시 - 제한적 응답 반환 (QR 인증 불가)
+        if IS_CLOUD:
+            logger.warning("Cloud 환경에서 샤오홍슈 크롤링 제한적 - QR 인증 불가")
+            return {
+                "platform": "xiaohongshu",
+                "url": url,
+                "author": None,
+                "title": None,
+                "likes": 0,
+                "favorites": 0,
+                "comments": 0,
+                "shares": 0,
+                "views": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": "cloud_qr_auth_required",
+            }
+
+        # 3. Selenium fallback (로컬 환경)
         if self.driver is None:
             self.driver = self._create_driver()
 
