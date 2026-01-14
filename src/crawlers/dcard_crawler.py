@@ -663,10 +663,27 @@ class DcardCrawler:
             result = self._crawl_via_api(post_id)
             if result:
                 return result
-            logger.info("API 방식 실패, Selenium fallback 시도...")
+            logger.info("API 방식 실패...")
 
-        # 2. Cloud 환경에서 API 실패 시 에러 (Selenium은 Cloud에서 Cloudflare 우회 불가)
-        if IS_CLOUD and not (self.use_api and self.scraper):
+        # 2. Cloud 환경에서는 API만 지원 (Selenium은 Cloudflare 우회 불가)
+        if IS_CLOUD:
+            # API를 시도했으나 실패한 경우
+            if self.use_api and self.scraper:
+                logger.warning("Cloud 환경에서 Dcard API 실패 - Cloudflare 차단 가능성")
+                return {
+                    "platform": "dcard",
+                    "url": url,
+                    "post_id": post_id,
+                    "author": None,
+                    "title": None,
+                    "likes": 0,
+                    "comments": 0,
+                    "shares": 0,
+                    "views": None,
+                    "crawled_at": datetime.now().isoformat(),
+                    "error": "cloud_api_blocked",
+                }
+            # cloudscraper가 설치되지 않은 경우
             raise DcardCloudflareError(
                 "Cloud 환경에서는 cloudscraper + API 방식만 지원됩니다. "
                 "cloudscraper 라이브러리가 설치되어 있는지 확인하세요."
