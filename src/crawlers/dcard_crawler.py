@@ -629,7 +629,7 @@ class DcardCrawler:
                 props = data.get("props", {}).get("pageProps", {})
                 post = props.get("post") or props.get("initialPost", {})
 
-                if post:
+                if post and post.get("likeCount") is not None:
                     result["title"] = post.get("title", "")
                     result["likes"] = post.get("likeCount", 0) or 0
                     result["comments"] = post.get("commentCount", 0) or 0
@@ -673,7 +673,7 @@ class DcardCrawler:
                 result["created_at"] = created_match.group(1)
 
             # 데이터가 추출되었으면 반환
-            if result["likes"] > 0 or result["comments"] > 0 or result["title"]:
+            if result["likes"] > 0 or result["comments"] > 0:
                 logger.info(f"JSON 패턴에서 데이터 추출 성공: likes={result['likes']}, comments={result['comments']}")
                 # 포럼 (URL에서)
                 forum_match = re.search(r'/f/([^/]+)/p/', url)
@@ -683,10 +683,14 @@ class DcardCrawler:
                     result["author"] = "Anonymous"
                 return result
 
-            # === DOM에서 직접 추출 (최종 백업) ===
-            logger.info("DOM에서 직접 데이터 추출 시도")
+            # === DOM에서 직접 추출 (CSR 대응) ===
+            logger.info("DOM에서 직접 데이터 추출 시도 (스크롤 후)")
 
-            # 제목
+            # 스크롤하여 engagement 영역 로드
+            self.driver.execute_script("window.scrollTo(0, 500);")
+            time.sleep(3)
+
+            # 제목 추출
             try:
                 title_elem = self.driver.find_element(By.XPATH, "//h1")
                 result["title"] = title_elem.text.strip()
@@ -697,6 +701,56 @@ class DcardCrawler:
             forum_match = re.search(r'/f/([^/]+)/p/', url)
             if forum_match:
                 result["forum"] = forum_match.group(1)
+
+            # JavaScript로 reaction 영역에서 숫자 추출
+            engagement_data = self.driver.execute_script('''
+                var results = {likes: 0, comments: 0};
+
+                // 방법 1: SVG 아이콘 근처의 숫자 찾기
+                var svgs = document.querySelectorAll('svg');
+                svgs.forEach(function(svg) {
+                    var parent = svg.parentElement;
+                    if (parent) {
+                        var container = parent.parentElement;
+                        if (container) {
+                            var rect = parent.getBoundingClientRect();
+                            // 게시물 본문 하단 영역 (y > 500)
+                            if (rect.y > 500 && rect.y < 900) {
+                                var text = container.innerText || '';
+                                var nums = text.match(/\\d+/g);
+                                if (nums && nums.length >= 1) {
+                                    // 첫 번째 숫자는 좋아요, 두 번째는 댓글
+                                    if (results.likes === 0) {
+                                        results.likes = parseInt(nums[0]) || 0;
+                                        if (nums.length >= 2) {
+                                            results.comments = parseInt(nums[1]) || 0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // 방법 2: 특정 패턴으로 숫자 찾기 (백업)
+                if (results.likes === 0) {
+                    var allText = document.body.innerText || '';
+                    // "252 32" 같은 패턴 찾기 (reaction 영역)
+                    var matches = allText.match(/(\\d+)\\s+(\\d+)\\s*$/m);
+                    if (matches) {
+                        results.likes = parseInt(matches[1]) || 0;
+                        results.comments = parseInt(matches[2]) || 0;
+                    }
+                }
+
+                return results;
+            ''')
+
+            if engagement_data:
+                if engagement_data.get("likes", 0) > 0:
+                    result["likes"] = engagement_data["likes"]
+                if engagement_data.get("comments", 0) > 0:
+                    result["comments"] = engagement_data["comments"]
 
             if not result["author"]:
                 result["author"] = "Anonymous"
