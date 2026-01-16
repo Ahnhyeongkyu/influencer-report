@@ -6,6 +6,7 @@
 selenium>=4.15.0
 webdriver-manager>=4.0.0
 seleniumbase>=4.23.0
+undetected-chromedriver>=3.5.0
 
 # === 웹 UI ===
 streamlit>=1.28.0
@@ -35,7 +36,7 @@ lxml>=4.9.0
 yt-dlp>=2024.1.0
 
 # === Dcard 크롤링 (Cloudflare 우회) ===
-cloudscraper>=1.2.71
+cloudscraper25>=1.0.0  # Enhanced fork with v2/v3 support
 
 # === HTTP 요청 (API 기반 크롤링) ===
 httpx>=0.27.0

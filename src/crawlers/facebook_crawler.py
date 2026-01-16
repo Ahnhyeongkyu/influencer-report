@@ -46,6 +46,13 @@ from selenium.common.exceptions import (
     StaleElementReferenceException,
 )
 
+# undetected_chromedriver for bot detection bypass
+try:
+    import undetected_chromedriver as uc
+    HAS_UNDETECTED = True
+except ImportError:
+    HAS_UNDETECTED = False
+
 # Streamlit Cloud 환경 감지
 IS_CLOUD = platform.system() == "Linux" and os.path.exists("/etc/debian_version")
 
@@ -415,6 +422,19 @@ class FacebookCrawler:
         Returns:
             Chrome WebDriver 인스턴스
         """
+        # 로컬 환경에서 undetected_chromedriver 사용 (Facebook 봇 탐지 우회에 효과적)
+        if HAS_UNDETECTED and not IS_CLOUD:
+            logger.info("undetected_chromedriver 사용")
+            uc_options = uc.ChromeOptions()
+            uc_options.add_argument("--no-sandbox")
+            uc_options.add_argument("--disable-dev-shm-usage")
+            if self.headless:
+                uc_options.add_argument("--headless=new")
+            driver = uc.Chrome(options=uc_options, use_subprocess=True)
+            logger.info("Stealth Chrome WebDriver 생성 완료 (undetected)")
+            return driver
+
+        # Cloud 환경 또는 undetected 없는 경우 기존 로직
         options = Options()
 
         # Cloud 환경이면 headless 강제
@@ -812,33 +832,46 @@ class FacebookCrawler:
         text = text.strip()
         text_lower = text.lower()
 
+        # 숫자 추출 헬퍼 함수 (점만 있는 경우 제외)
+        def extract_number(pattern, text):
+            match = re.search(pattern, text)
+            if match:
+                val = match.group()
+                # 숫자가 포함되어 있는지 확인 (점만 있는 경우 제외)
+                if re.search(r'\d', val):
+                    try:
+                        return float(val)
+                    except ValueError:
+                        pass
+            return None
+
         # K/천 단위 (먼저 체크)
         if "k" in text_lower or "천" in text:
-            num = re.search(r"[\d.]+", text)
-            if num:
-                return int(float(num.group()) * 1000)
+            num = extract_number(r"[\d.]+", text)
+            if num is not None:
+                return int(num * 1000)
 
         # M 단위 (million) - 영어권
         if "m" in text_lower and "만" not in text:
-            num = re.search(r"[\d.]+", text)
-            if num:
-                return int(float(num.group()) * 1000000)
+            num = extract_number(r"[\d.]+", text)
+            if num is not None:
+                return int(num * 1000000)
 
         # 만 단위 (한국어)
         if "만" in text:
-            num = re.search(r"[\d.]+", text)
-            if num:
-                return int(float(num.group()) * 10000)
+            num = extract_number(r"[\d.]+", text)
+            if num is not None:
+                return int(num * 10000)
 
         # B/억 단위
         if "b" in text_lower or "억" in text:
-            num = re.search(r"[\d.]+", text)
-            if num:
-                return int(float(num.group()) * 100000000)
+            num = extract_number(r"[\d.]+", text)
+            if num is not None:
+                return int(num * 100000000)
 
         # 숫자만 있는 경우 (접미사 처리 후)
         clean_text = re.sub(r"[^\d.]", "", text.replace(",", ""))
-        if clean_text:
+        if clean_text and re.search(r'\d', clean_text):
             try:
                 # 소수점이 있으면 float으로 변환 후 int
                 return int(float(clean_text))
@@ -1098,6 +1131,10 @@ class FacebookCrawler:
             # 추가 대기 (동적 콘텐츠 로드)
             time.sleep(2)
 
+            # 스크롤해서 콘텐츠 로드 유도
+            self.driver.execute_script("window.scrollTo(0, 300)")
+            time.sleep(2)
+
             # 로그인 필요 여부 확인
             current_url = self.driver.current_url
             if "login" in current_url.lower() or "checkpoint" in current_url.lower():
@@ -1105,17 +1142,21 @@ class FacebookCrawler:
                 result["error"] = "login_required"
                 return result
 
-            # === 데이터 추출 ===
+            # === JSON 패턴으로 데이터 추출 (가장 먼저 시도) ===
+            self._try_javascript_extraction(result)
+
+            # JSON에서 데이터를 찾았으면 DOM 파싱 스킵
+            if result["likes"] > 0 or result["comments"] > 0:
+                logger.info("JSON 데이터 추출 성공")
+                return result
+
+            # === DOM 기반 데이터 추출 (fallback) ===
             result["author"] = self._extract_author(self.driver)
             result["content"] = self._extract_content(self.driver)
             result["likes"] = self._extract_reactions(self.driver)
             result["comments"] = self._extract_comments_count(self.driver)
             result["shares"] = self._extract_shares_count(self.driver)
             result["views"] = self._extract_views_count(self.driver)
-
-            # JavaScript로 추가 데이터 추출 시도
-            if result["likes"] == 0:
-                self._try_javascript_extraction(result)
 
             logger.info(
                 f"데이터 추출 완료: likes={result['likes']}, "
@@ -1142,40 +1183,60 @@ class FacebookCrawler:
         try:
             page_source = self.driver.page_source
 
-            # 반응 수 추출
+            # 반응 수 추출 (다양한 패턴 시도)
             reaction_patterns = [
+                # 2026년 새 패턴 - i18n_reaction_count (JSON escape 버전)
+                r'\"i18n_reaction_count\":\"(\d+)\"',
+                # reaction_count (JSON escape 버전)
+                r'\"reaction_count\":\{\"count\":(\d+)',
+                # 기존 패턴들
                 r'"reaction_count"\s*:\s*\{"count"\s*:\s*(\d+)',
                 r'"likecount"\s*:\s*(\d+)',
                 r'"like_count"\s*:\s*(\d+)',
+                # 추가 패턴
+                r'"total_count":(\d+).*?"reaction"',
             ]
             for pattern in reaction_patterns:
-                match = re.search(pattern, page_source, re.IGNORECASE)
-                if match:
-                    result["likes"] = int(match.group(1))
-                    break
+                matches = re.findall(pattern, page_source, re.IGNORECASE)
+                if matches:
+                    # 가장 큰 값 사용 (여러 값이 있을 경우)
+                    max_count = max(int(m) for m in matches)
+                    if max_count > 0:
+                        result["likes"] = max_count
+                        logger.info(f"JSON에서 반응 수 추출: {max_count}")
+                        break
 
             # 댓글 수 추출
             comment_patterns = [
+                r'\"comment_count\":\{\"total_count\":(\d+)',
                 r'"comment_count"\s*:\s*\{"total_count"\s*:\s*(\d+)',
                 r'"commentcount"\s*:\s*(\d+)',
                 r'"comments"\s*:\s*\{"count"\s*:\s*(\d+)',
+                r'"comment_rendering_instance".*?"count":(\d+)',
             ]
             for pattern in comment_patterns:
-                match = re.search(pattern, page_source, re.IGNORECASE)
-                if match:
-                    result["comments"] = int(match.group(1))
-                    break
+                matches = re.findall(pattern, page_source, re.IGNORECASE)
+                if matches:
+                    max_count = max(int(m) for m in matches)
+                    if max_count > 0:
+                        result["comments"] = max_count
+                        logger.info(f"JSON에서 댓글 수 추출: {max_count}")
+                        break
 
             # 공유 수 추출
             share_patterns = [
+                r'\"share_count\":\{\"count\":(\d+)',
                 r'"share_count"\s*:\s*\{"count"\s*:\s*(\d+)',
                 r'"sharecount"\s*:\s*(\d+)',
             ]
             for pattern in share_patterns:
-                match = re.search(pattern, page_source, re.IGNORECASE)
-                if match:
-                    result["shares"] = int(match.group(1))
-                    break
+                matches = re.findall(pattern, page_source, re.IGNORECASE)
+                if matches:
+                    max_count = max(int(m) for m in matches)
+                    if max_count > 0:
+                        result["shares"] = max_count
+                        logger.info(f"JSON에서 공유 수 추출: {max_count}")
+                        break
 
         except Exception as e:
             logger.debug(f"JavaScript 데이터 추출 실패: {e}")
@@ -1242,6 +1303,19 @@ class FacebookCrawler:
         # 4. Selenium fallback (로컬 환경)
         if self.driver is None:
             self.driver = self._create_driver()
+
+            # 저장된 쿠키 로드 시도
+            if self.cookie_file.exists():
+                logger.info("저장된 쿠키로 Selenium 세션 복원 시도...")
+                if self._load_cookies():
+                    # 로그인 상태 확인 (Instagram 크롤러와 동일한 패턴)
+                    if self._check_login_status():
+                        self.is_logged_in = True
+                        logger.info("쿠키로 로그인 상태 복원 성공")
+                    else:
+                        logger.warning("쿠키가 만료되었거나 유효하지 않음")
+                else:
+                    logger.warning("쿠키 로드 실패")
 
         # 로그인 필요시
         if require_login and not self.is_logged_in:
