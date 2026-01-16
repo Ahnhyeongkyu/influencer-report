@@ -22,12 +22,19 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
-# cloudscraper for Cloudflare bypass
+# cloudscraper25 for Cloudflare v2/v3 bypass (enhanced fork)
 try:
-    import cloudscraper
+    import cloudscraper25 as cloudscraper
     HAS_CLOUDSCRAPER = True
+    CLOUDSCRAPER_VERSION = "v25"
 except ImportError:
-    HAS_CLOUDSCRAPER = False
+    try:
+        import cloudscraper
+        HAS_CLOUDSCRAPER = True
+        CLOUDSCRAPER_VERSION = "legacy"
+    except ImportError:
+        HAS_CLOUDSCRAPER = False
+        CLOUDSCRAPER_VERSION = None
 
 # Streamlit Cloud 환경 감지
 IS_CLOUD = platform.system() == "Linux" and os.path.exists("/etc/debian_version")
@@ -130,34 +137,54 @@ class DcardCrawler:
         logger.info(f"DcardCrawler 초기화 완료 (use_api={use_api}, headless={headless})")
 
     def _init_scraper(self) -> None:
-        """cloudscraper 인스턴스 초기화"""
+        """cloudscraper 인스턴스 초기화 (v2/v3 지원 강화)"""
         try:
-            self.scraper = cloudscraper.create_scraper(
-                browser={
+            # cloudscraper25는 더 강력한 옵션 지원
+            scraper_options = {
+                'browser': {
                     'browser': 'chrome',
                     'platform': 'windows',
                     'desktop': True,
                 },
-                delay=10,
-            )
-            # 헤더 설정
+                'delay': 5,  # 초기 딜레이
+            }
+
+            # cloudscraper25 전용 옵션 (v2/v3 지원)
+            if CLOUDSCRAPER_VERSION == "v25":
+                scraper_options.update({
+                    'interpreter': 'nodejs',  # JS 해석기 (더 정확)
+                    'allow_brotli': True,
+                    'debug': False,
+                })
+
+            self.scraper = cloudscraper.create_scraper(**scraper_options)
+
+            # 헤더 설정 (더 자연스러운 브라우저처럼)
             self.scraper.headers.update({
-                'Accept': 'application/json',
-                'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept-Encoding': 'gzip, deflate, br',
                 'Referer': 'https://www.dcard.tw/',
                 'Origin': 'https://www.dcard.tw',
+                'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                'Sec-Ch-Ua-Mobile': '?0',
+                'Sec-Ch-Ua-Platform': '"Windows"',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
             })
-            logger.info("cloudscraper 초기화 완료")
+            logger.info(f"cloudscraper 초기화 완료 (version={CLOUDSCRAPER_VERSION})")
         except Exception as e:
             logger.warning(f"cloudscraper 초기화 실패: {e}")
             self.scraper = None
 
-    def _crawl_via_api(self, post_id: str) -> Optional[Dict[str, Any]]:
+    def _crawl_via_api(self, post_id: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
         """
-        Dcard API를 통한 게시물 데이터 크롤링
+        Dcard API를 통한 게시물 데이터 크롤링 (재시도 로직 포함)
 
         Args:
             post_id: 게시물 ID
+            max_retries: 최대 재시도 횟수
 
         Returns:
             게시물 데이터 또는 None (실패 시)
@@ -165,48 +192,68 @@ class DcardCrawler:
         if not self.scraper:
             return None
 
-        try:
-            # API 엔드포인트
-            api_url = f"{self.API_URL}/{post_id}"
-            logger.info(f"Dcard API 호출: {api_url}")
+        api_url = f"{self.API_URL}/{post_id}"
 
-            response = self.scraper.get(api_url, timeout=self.timeout)
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    wait_time = 3 * (attempt + 1)  # 점진적 대기: 6초, 9초...
+                    logger.info(f"재시도 {attempt + 1}/{max_retries} - {wait_time}초 대기...")
+                    print(f"[Dcard] 재시도 {attempt + 1}/{max_retries} - {wait_time}초 대기...")
+                    time.sleep(wait_time)
 
-            if response.status_code == 200:
-                data = response.json()
-                result = {
-                    "platform": "dcard",
-                    "url": f"{self.BASE_URL}/f/{data.get('forumAlias', 'all')}/p/{post_id}",
-                    "post_id": str(post_id),
-                    "author": data.get("school") or "Anonymous",
-                    "title": data.get("title", ""),
-                    "likes": data.get("likeCount", 0) or 0,
-                    "comments": data.get("commentCount", 0) or 0,
-                    "shares": data.get("shareCount"),
-                    "views": data.get("viewCount"),
-                    "forum": data.get("forumAlias", ""),
-                    "created_at": data.get("createdAt", ""),
-                    "crawled_at": datetime.now().isoformat(),
-                }
-                logger.info(f"API 크롤링 성공: likes={result['likes']}, comments={result['comments']}")
-                return result
-            elif response.status_code == 404:
-                logger.error(f"게시물을 찾을 수 없음: {post_id}")
-                raise DcardPostNotFoundError(f"게시물 ID {post_id}를 찾을 수 없습니다.")
-            else:
-                logger.warning(f"API 응답 오류: {response.status_code}")
-                return None
+                logger.info(f"Dcard API 호출: {api_url}")
+                response = self.scraper.get(api_url, timeout=self.timeout)
 
-        except DcardPostNotFoundError:
-            raise
-        except Exception as e:
-            logger.warning(f"API 크롤링 실패: {e}")
-            return None
+                if response.status_code == 200:
+                    data = response.json()
+                    result = {
+                        "platform": "dcard",
+                        "url": f"{self.BASE_URL}/f/{data.get('forumAlias', 'all')}/p/{post_id}",
+                        "post_id": str(post_id),
+                        "author": data.get("school") or "Anonymous",
+                        "title": data.get("title", ""),
+                        "likes": data.get("likeCount", 0) or 0,
+                        "comments": data.get("commentCount", 0) or 0,
+                        "shares": data.get("shareCount"),
+                        "views": data.get("viewCount"),
+                        "forum": data.get("forumAlias", ""),
+                        "created_at": data.get("createdAt", ""),
+                        "crawled_at": datetime.now().isoformat(),
+                    }
+                    logger.info(f"API 크롤링 성공: likes={result['likes']}, comments={result['comments']}")
+                    return result
+
+                elif response.status_code == 404:
+                    logger.error(f"게시물을 찾을 수 없음: {post_id}")
+                    raise DcardPostNotFoundError(f"게시물 ID {post_id}를 찾을 수 없습니다.")
+
+                elif response.status_code == 403:
+                    logger.warning(f"Cloudflare 차단 감지 (403) - 재시도 중...")
+                    print(f"[Dcard] Cloudflare 보안 감지됨 - 재시도 중...")
+                    # 재시도를 위해 continue
+
+                elif response.status_code == 429:
+                    logger.warning(f"Rate limit 초과 (429) - 대기 후 재시도...")
+                    print(f"[Dcard] 요청 제한 감지됨 - 잠시 대기...")
+                    time.sleep(10)  # Rate limit은 더 오래 대기
+
+                else:
+                    logger.warning(f"API 응답 오류: {response.status_code}")
+
+            except DcardPostNotFoundError:
+                raise
+            except Exception as e:
+                logger.warning(f"API 크롤링 시도 {attempt + 1} 실패: {e}")
+                if attempt == max_retries - 1:
+                    logger.error(f"API 크롤링 최종 실패: {e}")
+
+        return None
 
     def _create_driver(self):
         """
-        Chrome WebDriver 생성
-        - 로컬: undetected-chromedriver 사용
+        Chrome WebDriver 생성 (스텔스 옵션 강화)
+        - 로컬: undetected-chromedriver 사용 (최대 스텔스)
         - Cloud: 일반 Selenium 사용 (fallback)
 
         Returns:
@@ -216,7 +263,7 @@ class DcardCrawler:
         if IS_CLOUD:
             return self._create_cloud_driver()
 
-        # 로컬: undetected-chromedriver 시도
+        # 로컬: undetected-chromedriver 시도 (스텔스 옵션 강화)
         try:
             import undetected_chromedriver as uc
 
@@ -225,16 +272,65 @@ class DcardCrawler:
             if self.headless:
                 options.add_argument("--headless=new")
 
-            # 기본 옵션
+            # === 스텔스 옵션 강화 ===
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--window-size=1920,1080")
+            options.add_argument("--start-maximized")
 
             # 언어 설정 (대만 중국어)
             options.add_argument("--lang=zh-TW")
 
-            driver = uc.Chrome(options=options)
-            logger.info("undetected-chromedriver 생성 완료")
+            # 봇 탐지 우회 옵션
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-infobars")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-popup-blocking")
+
+            # GPU 관련 (일부 환경에서 탐지 방지)
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-software-rasterizer")
+
+            # 실제 브라우저처럼 보이게
+            options.add_argument("--disable-features=VizDisplayCompositor")
+            options.add_argument("--enable-features=NetworkService,NetworkServiceInProcess")
+
+            # 프로필 설정 (더 자연스럽게)
+            options.add_argument("--disable-background-networking")
+            options.add_argument("--disable-default-apps")
+            options.add_argument("--disable-sync")
+
+            # undetected-chromedriver 특수 옵션
+            driver = uc.Chrome(
+                options=options,
+                use_subprocess=True,  # 서브프로세스 사용 (탐지 회피)
+                version_main=None,  # 자동 버전 매칭
+            )
+
+            # 추가 스텔스 JavaScript 실행
+            driver.execute_script("""
+                // WebDriver 속성 숨기기
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+
+                // 플러그인 배열 조작
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+
+                // 언어 설정
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-TW', 'zh', 'en-US', 'en']
+                });
+
+                // Chrome 객체 확인
+                window.chrome = {
+                    runtime: {}
+                };
+            """)
+
+            logger.info("undetected-chromedriver 생성 완료 (스텔스 모드)")
             return driver
 
         except ImportError:
@@ -657,13 +753,15 @@ class DcardCrawler:
         else:
             post_id = self._extract_post_id(url)
 
-        # 1. API 방식 우선 시도 (Cloud 환경에서 효과적)
+        # 1. API 방식 우선 시도 (cloudscraper25 v2/v3 지원)
         if self.use_api and self.scraper and post_id:
-            logger.info("API 방식으로 크롤링 시도...")
-            result = self._crawl_via_api(post_id)
+            print(f"[Dcard] API로 크롤링 시도 중... (cloudscraper {CLOUDSCRAPER_VERSION})")
+            logger.info(f"API 방식으로 크롤링 시도 (version={CLOUDSCRAPER_VERSION})...")
+            result = self._crawl_via_api(post_id, max_retries=3)
             if result:
                 return result
-            logger.info("API 방식 실패...")
+            print("[Dcard] API 방식 실패, 브라우저 모드로 전환 중...")
+            logger.info("API 방식 실패, Selenium fallback...")
 
         # 2. Cloud 환경에서는 API만 지원 (Selenium은 Cloudflare 우회 불가)
         if IS_CLOUD:
@@ -691,6 +789,8 @@ class DcardCrawler:
 
         # 3. Selenium fallback (로컬 환경)
         if self.driver is None:
+            print("[Dcard] Chrome 브라우저 시작 중...")
+            logger.info("Chrome WebDriver 생성 중...")
             self.driver = self._create_driver()
 
             # 저장된 쿠키로 세션 복원 시도
@@ -698,7 +798,72 @@ class DcardCrawler:
                 self._load_cookies()
 
         # 게시물 데이터 추출
-        return self._extract_post_data(url)
+        print("[Dcard] 페이지 로드 중...")
+        try:
+            result = self._extract_post_data(url)
+
+            # Cloudflare/IP 차단 확인 (여러 패턴 검사)
+            if result.get('likes', 0) == 0 and result.get('comments', 0) == 0 and not result.get('title'):
+                page_source = self.driver.page_source.lower() if self.driver else ""
+                page_title = self.driver.title.lower() if self.driver else ""
+
+                # 차단 패턴 검사
+                block_patterns = [
+                    "blocked", "차단", "access denied", "forbidden",
+                    "cloudflare", "just a moment", "checking your browser",
+                    "ray id", "security check", "captcha"
+                ]
+
+                is_blocked = any(pattern in page_source or pattern in page_title for pattern in block_patterns)
+
+                if is_blocked:
+                    print("")
+                    print("=" * 60)
+                    print("[Dcard] ⚠️ Cloudflare 보안에 의해 차단되었습니다.")
+                    print("")
+                    print("해결 방법:")
+                    print("  1. VPN을 사용하세요 (대만 서버 권장)")
+                    print("  2. 다른 네트워크로 변경하세요 (휴대폰 핫스팟 등)")
+                    print("  3. 잠시 후 다시 시도하세요 (10-30분)")
+                    print("")
+                    print("참고: Dcard는 대만 플랫폼으로 Cloudflare Enterprise 보안을")
+                    print("      사용하여 해외 접속이 불안정할 수 있습니다.")
+                    print("=" * 60)
+                    print("")
+
+                    result["error"] = (
+                        "Cloudflare 보안 차단 - "
+                        "VPN(대만 서버) 사용 또는 다른 네트워크로 시도해주세요. "
+                        "Dcard는 대만 플랫폼으로 해외 접속이 제한될 수 있습니다."
+                    )
+
+            return result
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[Dcard] 오류: {error_msg}")
+
+            # 에러 유형별 안내
+            if "timeout" in error_msg.lower():
+                error_detail = "페이지 로드 시간 초과 - 네트워크 상태를 확인하세요."
+            elif "cloudflare" in error_msg.lower():
+                error_detail = "Cloudflare 보안 차단 - VPN 사용을 권장합니다."
+            else:
+                error_detail = f"크롤링 실패: {error_msg}"
+
+            return {
+                "platform": "dcard",
+                "url": url,
+                "post_id": post_id,
+                "author": None,
+                "title": None,
+                "likes": 0,
+                "comments": 0,
+                "shares": 0,
+                "views": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": error_detail,
+            }
 
     def crawl_posts(
         self,

@@ -47,6 +47,13 @@ from selenium.common.exceptions import (
     StaleElementReferenceException,
 )
 
+# undetected_chromedriver for bot detection bypass
+try:
+    import undetected_chromedriver as uc
+    HAS_UNDETECTED = True
+except ImportError:
+    HAS_UNDETECTED = False
+
 # Streamlit Cloud 환경 감지
 IS_CLOUD = platform.system() == "Linux" and os.path.exists("/etc/debian_version")
 
@@ -97,8 +104,8 @@ class InstagramCrawler:
     BASE_URL = "https://www.instagram.com"
 
     # 기본 설정
-    DEFAULT_TIMEOUT = 30
-    PAGE_LOAD_WAIT = 3
+    DEFAULT_TIMEOUT = 45  # 30 -> 45초로 증가 (Instagram 봇 탐지 대응)
+    PAGE_LOAD_WAIT = 5    # 3 -> 5초로 증가
     LOGIN_TIMEOUT = 60
 
     # 쿠키 파일 경로
@@ -190,12 +197,22 @@ class InstagramCrawler:
 
             logger.info(f"requests API로 크롤링: shortcode={shortcode}")
 
+            # 쿠키 상태 로깅 (디버깅용)
+            cookie_names = list(self.session.cookies.keys())
+            if cookie_names:
+                logger.info(f"적용된 쿠키: {cookie_names}")
+            else:
+                logger.info("쿠키 없음 - 비로그인 상태로 시도")
+
             # 페이지 HTML 요청
             page_url = f"{self.BASE_URL}/p/{shortcode}/"
             response = self.session.get(page_url, timeout=self.timeout)
 
             if response.status_code != 200:
                 logger.warning(f"페이지 요청 실패: {response.status_code}")
+                # 401/403인 경우 쿠키 문제일 가능성
+                if response.status_code in [401, 403]:
+                    logger.warning("인증 거부 - 쿠키가 만료되었거나 유효하지 않을 수 있습니다")
                 return None
 
             html = response.text
@@ -417,6 +434,19 @@ class InstagramCrawler:
         Returns:
             Chrome WebDriver 인스턴스
         """
+        # 로컬 환경에서 undetected_chromedriver 사용 (Instagram 봇 탐지 우회에 효과적)
+        if HAS_UNDETECTED and not IS_CLOUD:
+            logger.info("undetected_chromedriver 사용")
+            uc_options = uc.ChromeOptions()
+            uc_options.add_argument("--no-sandbox")
+            uc_options.add_argument("--disable-dev-shm-usage")
+            if self.headless:
+                uc_options.add_argument("--headless=new")
+            driver = uc.Chrome(options=uc_options, use_subprocess=True)
+            logger.info("Chrome WebDriver 생성 완료 (undetected)")
+            return driver
+
+        # Cloud 환경 또는 undetected 없는 경우 기존 로직
         options = Options()
 
         # Cloud 환경이면 headless 강제
@@ -878,10 +908,11 @@ class InstagramCrawler:
             shortcode 또는 None
         """
         # 다양한 URL 패턴 처리
+        # 예: instagram.com/p/ABC, instagram.com/username/p/ABC, instagram.com/reel/ABC
         patterns = [
-            r"instagram\.com/p/([A-Za-z0-9_-]+)",
-            r"instagram\.com/reel/([A-Za-z0-9_-]+)",
-            r"instagram\.com/tv/([A-Za-z0-9_-]+)",
+            r"instagram\.com/(?:[^/]+/)?p/([A-Za-z0-9_-]+)",
+            r"instagram\.com/(?:[^/]+/)?reel/([A-Za-z0-9_-]+)",
+            r"instagram\.com/(?:[^/]+/)?tv/([A-Za-z0-9_-]+)",
         ]
 
         for pattern in patterns:
@@ -890,6 +921,133 @@ class InstagramCrawler:
                 return match.group(1)
 
         return None
+
+    def _extract_from_embed_page(self, shortcode: str, result: dict) -> bool:
+        """
+        Embed 페이지에서 데이터 추출 (fallback 방법)
+
+        Instagram embed 페이지는 더 단순한 HTML 구조를 가지고 있어서
+        데이터 추출이 더 쉬움
+
+        Args:
+            shortcode: 게시물 shortcode
+            result: 결과 딕셔너리 (업데이트됨)
+
+        Returns:
+            True if data extracted successfully, False otherwise
+        """
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+        logger.info(f"Embed 페이지 fallback 시도: {embed_url}")
+
+        try:
+            # Embed 페이지 로드
+            self.driver.get(embed_url)
+            self._random_delay(3, 5)
+
+            page_source = self.driver.page_source
+
+            # === Embed 페이지 JSON 데이터 추출 ===
+            # embed 페이지에는 보통 __additionalDataLoaded 또는 window.__initialData 가 있음
+
+            # 방법 1: Embed 페이지 내 JSON 패턴
+            json_patterns = [
+                r'window\.__additionalDataLoaded\s*\(\s*[\'"][^\'"]+[\'"]\s*,\s*(\{.*?\})\s*\)\s*;',
+                r'"edge_liked_by":\{"count":(\d+)',
+                r'"like_count":(\d+)',
+                r'"edge_media_preview_like":\{"count":(\d+)',
+            ]
+
+            # 좋아요 수
+            for pattern in [r'"edge_liked_by":\{"count":(\d+)', r'"like_count":(\d+)', r'"edge_media_preview_like":\{"count":(\d+)']:
+                match = re.search(pattern, page_source)
+                if match:
+                    result["likes"] = int(match.group(1))
+                    logger.info(f"Embed JSON에서 좋아요 수 추출: {result['likes']}")
+                    break
+
+            # 댓글 수
+            for pattern in [r'"edge_media_to_comment":\{"count":(\d+)', r'"comment_count":(\d+)', r'"edge_media_to_parent_comment":\{"count":(\d+)']:
+                match = re.search(pattern, page_source)
+                if match:
+                    result["comments"] = int(match.group(1))
+                    logger.info(f"Embed JSON에서 댓글 수 추출: {result['comments']}")
+                    break
+
+            # 조회수
+            for pattern in [r'"video_view_count":(\d+)', r'"play_count":(\d+)', r'"view_count":(\d+)']:
+                match = re.search(pattern, page_source)
+                if match:
+                    result["views"] = int(match.group(1))
+                    logger.info(f"Embed JSON에서 조회수 추출: {result['views']}")
+                    break
+
+            # 작성자
+            author_patterns = [
+                r'"username":"([^"]+)"',
+                r'href="https://www\.instagram\.com/([^/?"]+)/?["\?]',
+            ]
+            for pattern in author_patterns:
+                match = re.search(pattern, page_source)
+                if match:
+                    username = match.group(1)
+                    # 유효한 사용자명인지 확인 (p, reel, tv 등 제외)
+                    if username and username not in ['p', 'reel', 'tv', 'explore', 'stories']:
+                        result["author"] = username
+                        logger.info(f"Embed에서 작성자 추출: {result['author']}")
+                        break
+
+            # === 방법 2: DOM 파싱 (embed 페이지 구조) ===
+            if result["likes"] == 0:
+                try:
+                    # Embed 페이지의 좋아요 버튼/텍스트
+                    like_elements = self.driver.find_elements(
+                        By.XPATH,
+                        "//span[contains(@class, 'Likes') or contains(text(), 'like') or contains(text(), '좋아요')]"
+                    )
+                    for elem in like_elements:
+                        text = elem.text.strip()
+                        # "1,234 likes" 또는 숫자만 있는 경우
+                        count_match = re.search(r'([\d,]+)', text)
+                        if count_match:
+                            count = int(count_match.group(1).replace(',', ''))
+                            if count > 0:
+                                result["likes"] = count
+                                logger.info(f"Embed DOM에서 좋아요 추출: {count}")
+                                break
+                except Exception as e:
+                    logger.debug(f"Embed DOM 좋아요 추출 실패: {e}")
+
+            # 조회수 DOM 파싱 (비디오/릴스)
+            if result["views"] is None:
+                try:
+                    view_elements = self.driver.find_elements(
+                        By.XPATH,
+                        "//span[contains(text(), 'View') or contains(text(), 'view') or contains(text(), '조회')]"
+                    )
+                    for elem in view_elements:
+                        text = elem.text.strip()
+                        # "1,234 views" 패턴
+                        count_match = re.search(r'([\d,]+)', text)
+                        if count_match:
+                            count = int(count_match.group(1).replace(',', ''))
+                            if count > 0:
+                                result["views"] = count
+                                logger.info(f"Embed DOM에서 조회수 추출: {count}")
+                                break
+                except Exception as e:
+                    logger.debug(f"Embed DOM 조회수 추출 실패: {e}")
+
+            # 성공 여부 판단
+            if result["likes"] > 0 or result["comments"] > 0 or result["views"] is not None:
+                logger.info("Embed 페이지에서 데이터 추출 성공")
+                return True
+
+            logger.warning("Embed 페이지에서도 데이터 추출 실패")
+            return False
+
+        except Exception as e:
+            logger.error(f"Embed 페이지 추출 실패: {e}")
+            return False
 
     def _extract_post_data_from_page(self, url: str) -> dict:
         """
@@ -915,15 +1073,115 @@ class InstagramCrawler:
         try:
             # 게시물 페이지 로드
             self.driver.get(url)
-            self._random_delay(3, 5)
+            self._random_delay(5, 7)
 
-            # 페이지가 완전히 로드될 때까지 대기
-            WebDriverWait(self.driver, self.timeout).until(
-                EC.presence_of_element_located((By.TAG_NAME, "article"))
-            )
+            # 스크롤해서 동적 콘텐츠 로드 유도 (Instagram은 더 이상 article 태그 사용 안함)
+            self.driver.execute_script("window.scrollTo(0, 500)")
+            self._random_delay(2, 3)
+            self.driver.execute_script("window.scrollTo(0, 0)")
+            self._random_delay(3, 5)
 
             # 팝업 처리
             self._handle_login_popup()
+
+            # === HTML에서 JSON 데이터 직접 추출 ===
+            page_source = self.driver.page_source
+
+            # 방법 1: 기존 JSON 패턴 (여전히 작동할 수 있음)
+            like_patterns = [
+                r'"like_count":(\d+)',
+                r'"edge_media_preview_like":\{"count":(\d+)',
+                r'"edge_liked_by":\{"count":(\d+)',
+            ]
+            for pattern in like_patterns:
+                like_match = re.search(pattern, page_source)
+                if like_match:
+                    result["likes"] = int(like_match.group(1))
+                    logger.info(f"JSON에서 좋아요 수 추출: {result['likes']}")
+                    break
+
+            comment_patterns = [
+                r'"comment_count":(\d+)',
+                r'"edge_media_to_comment":\{"count":(\d+)',
+                r'"edge_media_to_parent_comment":\{"count":(\d+)',
+            ]
+            for pattern in comment_patterns:
+                comment_match = re.search(pattern, page_source)
+                if comment_match:
+                    result["comments"] = int(comment_match.group(1))
+                    logger.info(f"JSON에서 댓글 수 추출: {result['comments']}")
+                    break
+
+            view_patterns = [
+                r'"play_count":(\d+)',
+                r'"video_view_count":(\d+)',
+                r'"view_count":(\d+)',
+            ]
+            for pattern in view_patterns:
+                view_match = re.search(pattern, page_source)
+                if view_match:
+                    result["views"] = int(view_match.group(1))
+                    logger.info(f"JSON에서 조회수 추출: {result['views']}")
+                    break
+
+            # 작성자 추출 (여러 패턴 시도)
+            author_patterns = [
+                r'"owner":\s*\{[^}]*"username":\s*"([^"]+)"',
+                r'"user":\s*\{[^}]*"username":\s*"([^"]+)"',
+                r'"username":"([^"]+)".*?"is_verified"',
+            ]
+            for pattern in author_patterns:
+                author_match = re.search(pattern, page_source)
+                if author_match:
+                    result["author"] = author_match.group(1)
+                    logger.info(f"JSON에서 작성자 추출: {result['author']}")
+                    break
+
+            # JSON에서 데이터를 찾았으면 DOM 파싱 스킵
+            if result["likes"] > 0 or result["comments"] > 0:
+                logger.info("JSON 데이터 추출 성공, DOM 파싱 스킵")
+                return result
+
+            # 방법 2: span 요소에서 숫자 추출 (새로운 Instagram 구조)
+            logger.info("JSON 패턴 없음, DOM 직접 파싱 시도...")
+            try:
+                # 좋아요 수 - "좋아요 N개" 또는 "N likes" 패턴
+                like_elements = self.driver.find_elements(
+                    By.XPATH,
+                    "//span[contains(text(), '좋아요') or contains(text(), 'like')]"
+                )
+                for elem in like_elements:
+                    text = elem.text.strip()
+                    # "좋아요 1,234개" 또는 "1,234 likes" 패턴
+                    count_match = re.search(r'([\d,]+)', text)
+                    if count_match:
+                        count = int(count_match.group(1).replace(',', ''))
+                        if count > 0:
+                            result["likes"] = count
+                            logger.info(f"DOM에서 좋아요 수 추출: {count}")
+                            break
+            except Exception as e:
+                logger.debug(f"DOM 좋아요 추출 실패: {e}")
+
+            # 방법 3: section 내의 숫자 span 탐색
+            if result["likes"] == 0:
+                try:
+                    sections = self.driver.find_elements(By.TAG_NAME, "section")
+                    for section in sections:
+                        spans = section.find_elements(By.TAG_NAME, "span")
+                        for span in spans:
+                            text = span.text.strip()
+                            # 숫자만 있거나 "N개" 패턴
+                            if re.match(r'^[\d,]+[개]?$', text):
+                                count = int(re.sub(r'[^\d]', '', text))
+                                if count > 0 and result["likes"] == 0:
+                                    result["likes"] = count
+                                    logger.info(f"section span에서 좋아요 추출: {count}")
+                                    break
+                        if result["likes"] > 0:
+                            break
+                except Exception as e:
+                    logger.debug(f"section 스캔 실패: {e}")
 
             self._random_delay(2, 3)
 
@@ -1092,6 +1350,14 @@ class InstagramCrawler:
                 except Exception as e:
                     logger.debug(f"JavaScript 데이터 추출 실패: {e}")
 
+            # === Embed 페이지 Fallback ===
+            # 모든 방법이 실패한 경우 embed 페이지에서 추출 시도
+            if result["likes"] == 0 and result["comments"] == 0:
+                logger.info("기본 페이지에서 데이터 추출 실패, Embed 페이지 fallback 시도...")
+                shortcode = self._extract_shortcode_from_url(url)
+                if shortcode:
+                    self._extract_from_embed_page(shortcode, result)
+
             logger.info(
                 f"데이터 추출 완료: author={result['author']}, "
                 f"likes={result['likes']}, comments={result['comments']}, "
@@ -1235,12 +1501,22 @@ class InstagramCrawler:
                 "comments": 0,
                 "views": None,
                 "crawled_at": datetime.now().isoformat(),
-                "error": "cloud_scraping_limited",
+                "error": "로그인 쿠키가 필요합니다. 사이드바에서 인스타그램 쿠키를 설정해주세요.",
             }
 
         # 3. Selenium fallback (로컬 환경)
         if self.driver is None:
             self.driver = self._create_driver()
+
+            # 저장된 쿠키 로드 시도
+            if self.cookie_file.exists():
+                logger.info("저장된 쿠키로 Selenium 세션 복원 시도...")
+                if self._load_cookies():
+                    if self._check_login_status():
+                        self.is_logged_in = True
+                        logger.info("쿠키로 로그인 상태 복원 성공")
+                    else:
+                        logger.warning("쿠키가 만료되었거나 유효하지 않음")
 
         # 로그인이 필요한 경우
         if require_login and not self.is_logged_in:

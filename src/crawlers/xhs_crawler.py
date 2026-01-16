@@ -90,7 +90,7 @@ class XHSCrawler:
 
     # 쿠키 파일 경로
     COOKIE_DIR = Path(__file__).parent.parent.parent / "data" / "cookies"
-    COOKIE_FILE = COOKIE_DIR / "xhs_cookies.json"
+    COOKIE_FILE = COOKIE_DIR / "xiaohongshu_cookies.json"
 
     # API 헤더
     API_HEADERS = {
@@ -191,12 +191,21 @@ class XHSCrawler:
 
             logger.info(f"requests API로 크롤링: note_id={note_id}")
 
+            # 쿠키 상태 로깅 (디버깅용)
+            cookie_names = list(self.session.cookies.keys())
+            if cookie_names:
+                logger.info(f"적용된 쿠키: {cookie_names}")
+            else:
+                logger.info("쿠키 없음 - QR 로그인이 필요할 수 있습니다")
+
             # 페이지 HTML 요청
             page_url = f"{self.BASE_URL}/explore/{note_id}"
             response = self.session.get(page_url, timeout=self.timeout)
 
             if response.status_code != 200:
                 logger.warning(f"페이지 요청 실패: {response.status_code}")
+                if response.status_code in [401, 403]:
+                    logger.warning("인증 거부 - 쿠키가 만료되었거나 유효하지 않을 수 있습니다")
                 return None
 
             html = response.text
@@ -240,72 +249,162 @@ class XHSCrawler:
         }
 
         try:
-            # __INITIAL_STATE__ 또는 유사한 JSON 데이터 추출
-            state_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.+?})</script>', html, re.DOTALL)
-            if state_match:
-                try:
-                    # JSON 파싱 시도
+            # __INITIAL_STATE__ JSON 데이터 추출 (여러 패턴 시도)
+            state_patterns = [
+                r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\})\s*</script>',
+                r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\})\s*;?\s*\n',
+                r'<script>window\.__INITIAL_STATE__\s*=\s*(\{.+?\})</script>',
+            ]
+
+            state_text = None
+            for pattern in state_patterns:
+                state_match = re.search(pattern, html, re.DOTALL)
+                if state_match:
                     state_text = state_match.group(1)
+                    break
+
+            if state_text:
+                try:
                     # undefined를 null로 변환
                     state_text = re.sub(r'\bundefined\b', 'null', state_text)
+                    # function() 같은 JS 코드 제거
+                    state_text = re.sub(r'function\s*\([^)]*\)\s*\{[^}]*\}', 'null', state_text)
                     data = json.loads(state_text)
 
+                    logger.debug(f"__INITIAL_STATE__ 파싱 성공, 키: {list(data.keys())}")
+
+                    # noteDetailMap 구조에서 데이터 추출 (최신 샤오홍슈 구조)
+                    note_detail_map = data.get('note', {}).get('noteDetailMap', {})
+                    if note_detail_map:
+                        # noteDetailMap에서 note_id에 해당하는 데이터 찾기
+                        note_data = note_detail_map.get(note_id, {}).get('note', {})
+                        if not note_data:
+                            # note_id가 다를 수 있으므로 첫 번째 항목 사용
+                            for key, value in note_detail_map.items():
+                                if isinstance(value, dict) and 'note' in value:
+                                    note_data = value.get('note', {})
+                                    break
+
+                        if note_data:
+                            result['title'] = note_data.get('title', '') or note_data.get('desc', '')
+
+                            # interactInfo에서 상호작용 정보 추출
+                            interact_info = note_data.get('interactInfo', {})
+                            if interact_info:
+                                result['likes'] = int(interact_info.get('likedCount', 0) or 0)
+                                result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
+                                result['comments'] = int(interact_info.get('commentCount', 0) or 0)
+                                result['shares'] = int(interact_info.get('shareCount', 0) or 0)
+
+                            # user 정보에서 작성자 추출
+                            user = note_data.get('user', {})
+                            if user:
+                                result['author'] = user.get('nickname') or user.get('name')
+                                result['author_id'] = user.get('userId') or user.get('uid')
+
+                            if result.get('likes', 0) > 0 or result.get('author'):
+                                logger.info(f"noteDetailMap에서 데이터 추출 성공: likes={result['likes']}, author={result['author']}")
+                                return result
+
+                    # 구버전 구조: note.note
                     note_data = data.get('note', {}).get('note', {})
                     if note_data:
-                        result['title'] = note_data.get('title', '')
-                        result['likes'] = note_data.get('likedCount', 0) or 0
-                        result['favorites'] = note_data.get('collectedCount', 0) or 0
-                        result['comments'] = note_data.get('commentCount', 0) or 0
-                        result['shares'] = note_data.get('shareCount', 0) or 0
+                        result['title'] = note_data.get('title', '') or note_data.get('desc', '')
+
+                        # interactInfo 우선
+                        interact_info = note_data.get('interactInfo', {})
+                        if interact_info:
+                            result['likes'] = int(interact_info.get('likedCount', 0) or 0)
+                            result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
+                            result['comments'] = int(interact_info.get('commentCount', 0) or 0)
+                            result['shares'] = int(interact_info.get('shareCount', 0) or 0)
+                        else:
+                            # 직접 필드
+                            result['likes'] = int(note_data.get('likedCount', 0) or 0)
+                            result['favorites'] = int(note_data.get('collectedCount', 0) or 0)
+                            result['comments'] = int(note_data.get('commentCount', 0) or 0)
+                            result['shares'] = int(note_data.get('shareCount', 0) or 0)
 
                         user = note_data.get('user', {})
-                        result['author'] = user.get('nickname')
-                        result['author_id'] = user.get('userId')
+                        if user:
+                            result['author'] = user.get('nickname') or user.get('name')
+                            result['author_id'] = user.get('userId') or user.get('uid')
 
                         if result.get('likes', 0) > 0 or result.get('author'):
-                            logger.info(f"__INITIAL_STATE__에서 데이터 추출 성공")
+                            logger.info(f"note.note에서 데이터 추출 성공: likes={result['likes']}, author={result['author']}")
                             return result
-                except json.JSONDecodeError:
+
+                except json.JSONDecodeError as e:
+                    logger.debug(f"JSON 파싱 실패: {e}")
                     pass
 
-            # 정규식으로 직접 추출 시도
-            patterns = {
+            # 정규식으로 직접 추출 시도 (JSON 파싱 실패 시 백업)
+            # interactInfo 내부 데이터 패턴
+            interact_patterns = {
                 'likes': [
-                    r'"likedCount"\s*:\s*(\d+)',
-                    r'"liked_count"\s*:\s*(\d+)',
+                    r'"interactInfo"\s*:\s*\{[^}]*"likedCount"\s*:\s*"?(\d+)"?',
+                    r'"likedCount"\s*:\s*"?(\d+)"?',
+                    r'"liked_count"\s*:\s*"?(\d+)"?',
                 ],
                 'favorites': [
-                    r'"collectedCount"\s*:\s*(\d+)',
-                    r'"collected_count"\s*:\s*(\d+)',
+                    r'"interactInfo"\s*:\s*\{[^}]*"collectedCount"\s*:\s*"?(\d+)"?',
+                    r'"collectedCount"\s*:\s*"?(\d+)"?',
+                    r'"collected_count"\s*:\s*"?(\d+)"?',
                 ],
                 'comments': [
-                    r'"commentCount"\s*:\s*(\d+)',
-                    r'"comment_count"\s*:\s*(\d+)',
+                    r'"interactInfo"\s*:\s*\{[^}]*"commentCount"\s*:\s*"?(\d+)"?',
+                    r'"commentCount"\s*:\s*"?(\d+)"?',
+                    r'"comment_count"\s*:\s*"?(\d+)"?',
                 ],
                 'shares': [
-                    r'"shareCount"\s*:\s*(\d+)',
-                    r'"share_count"\s*:\s*(\d+)',
-                ],
-                'author': [
-                    r'"nickname"\s*:\s*"([^"]+)"',
-                ],
-                'title': [
-                    r'"title"\s*:\s*"([^"]+)"',
+                    r'"interactInfo"\s*:\s*\{[^}]*"shareCount"\s*:\s*"?(\d+)"?',
+                    r'"shareCount"\s*:\s*"?(\d+)"?',
+                    r'"share_count"\s*:\s*"?(\d+)"?',
                 ],
             }
 
-            for key, pattern_list in patterns.items():
+            # 작성자 패턴 (로그인 사용자가 아닌 게시물 작성자)
+            # noteDetailMap 내 user 정보를 찾아야 함
+            author_patterns = [
+                # noteDetailMap 내 user.nickname
+                r'"noteDetailMap"[^}]*"user"\s*:\s*\{[^}]*"nickname"\s*:\s*"([^"]+)"',
+                # note.user.nickname
+                r'"note"\s*:\s*\{[^}]*"user"\s*:\s*\{[^}]*"nickname"\s*:\s*"([^"]+)"',
+            ]
+
+            title_patterns = [
+                r'"noteDetailMap"[^}]*"title"\s*:\s*"([^"]+)"',
+                r'"note"\s*:\s*\{[^}]*"title"\s*:\s*"([^"]+)"',
+                r'"desc"\s*:\s*"([^"]{1,100})"',
+            ]
+
+            for key, pattern_list in interact_patterns.items():
                 for pattern in pattern_list:
                     match = re.search(pattern, html)
                     if match:
                         value = match.group(1)
-                        if key in ['likes', 'favorites', 'comments', 'shares']:
-                            result[key] = int(value)
-                        else:
-                            result[key] = value
+                        result[key] = int(value)
                         break
 
-            return result if result.get('likes', 0) > 0 or result.get('favorites', 0) > 0 or result.get('author') else None
+            # 작성자 추출 (첫 번째 매칭되는 것 사용)
+            for pattern in author_patterns:
+                match = re.search(pattern, html, re.DOTALL)
+                if match:
+                    result['author'] = match.group(1)
+                    break
+
+            # 제목 추출
+            for pattern in title_patterns:
+                match = re.search(pattern, html, re.DOTALL)
+                if match:
+                    result['title'] = match.group(1)
+                    break
+
+            if result.get('likes', 0) > 0 or result.get('favorites', 0) > 0 or result.get('author'):
+                logger.info(f"정규식으로 데이터 추출: likes={result['likes']}, author={result['author']}")
+                return result
+
+            return None
 
         except Exception as e:
             logger.debug(f"HTML 데이터 추출 실패: {e}")
@@ -650,9 +749,11 @@ class XHSCrawler:
         Returns:
             게시물 데이터 딕셔너리
         """
+        note_id = self._extract_note_id(url)
         result = {
             "platform": "xiaohongshu",
             "url": url,
+            "note_id": note_id,
             "author": None,
             "author_id": None,
             "title": None,
@@ -677,101 +778,124 @@ class XHSCrawler:
             # 추가 대기 (동적 콘텐츠 로드)
             time.sleep(2)
 
-            # === 작성자 정보 ===
+            # === 먼저 JavaScript로 __INITIAL_STATE__ 데이터 추출 시도 ===
+            try:
+                page_data = self.driver.execute_script("""
+                    if (window.__INITIAL_STATE__) {
+                        return JSON.stringify(window.__INITIAL_STATE__);
+                    }
+                    return null;
+                """)
+
+                if page_data:
+                    # __INITIAL_STATE__에서 데이터 추출
+                    html_result = self._extract_data_from_html(page_data, url, note_id or "")
+                    if html_result and (html_result.get('likes', 0) > 0 or html_result.get('author')):
+                        logger.info(f"JavaScript __INITIAL_STATE__에서 데이터 추출 성공")
+                        return html_result
+
+            except Exception as e:
+                logger.debug(f"JavaScript __INITIAL_STATE__ 추출 실패: {e}")
+
+            # === 페이지 소스에서 데이터 추출 시도 ===
+            try:
+                page_source = self.driver.page_source
+                html_result = self._extract_data_from_html(page_source, url, note_id or "")
+                if html_result and (html_result.get('likes', 0) > 0 or html_result.get('author')):
+                    logger.info(f"페이지 소스에서 데이터 추출 성공")
+                    return html_result
+            except Exception as e:
+                logger.debug(f"페이지 소스 추출 실패: {e}")
+
+            # === DOM 셀렉터 방식 (백업) ===
+            # === 작성자 정보 (최신 샤오홍슈 구조) ===
             author_selectors = [
+                # 최신 구조
+                "//div[contains(@class, 'author-wrapper')]//span[contains(@class, 'username')]",
+                "//a[contains(@class, 'author')]//span[contains(@class, 'name')]",
+                "//div[contains(@class, 'note-top')]//a[contains(@class, 'author')]",
+                "//div[contains(@class, 'info')]//a[contains(@class, 'name')]",
+                # 구버전 구조
                 "//a[contains(@class, 'author')]//span",
                 "//div[contains(@class, 'author')]//span[@class='username']",
-                "//a[contains(@class, 'name')]",
                 "//span[contains(@class, 'user-name')]",
                 "//div[contains(@class, 'user-info')]//span",
             ]
             for selector in author_selectors:
                 try:
                     author_elem = self.driver.find_element(By.XPATH, selector)
-                    result["author"] = author_elem.text.strip()
-                    if result["author"]:
+                    text = author_elem.text.strip()
+                    # 로그인 사용자가 아닌 게시물 작성자인지 확인
+                    if text and len(text) > 0:
+                        result["author"] = text
                         break
                 except NoSuchElementException:
                     continue
 
-            # === 제목 ===
+            # === 제목 (최신 구조) ===
             title_selectors = [
-                "//div[contains(@class, 'title')]",
+                "//div[@id='detail-title']",
+                "//div[contains(@class, 'title')]//span",
+                "//div[contains(@class, 'note-content')]//div[contains(@class, 'title')]",
+                "//div[contains(@class, 'desc')]",
                 "//h1",
-                "//div[contains(@class, 'note-content')]//div[1]",
             ]
             for selector in title_selectors:
                 try:
                     title_elem = self.driver.find_element(By.XPATH, selector)
-                    result["title"] = title_elem.text.strip()[:100]  # 최대 100자
-                    if result["title"]:
+                    text = title_elem.text.strip()
+                    # 기본 페이지 제목이 아닌지 확인
+                    if text and not text.startswith("小红书") and "沪ICP" not in text:
+                        result["title"] = text[:100]
                         break
                 except NoSuchElementException:
                     continue
 
-            # === 좋아요 수 ===
-            like_selectors = [
-                "//span[contains(@class, 'like-count')]",
-                "//span[contains(@class, 'count') and preceding-sibling::*[contains(@class, 'like')]]",
-                "//div[contains(@class, 'like')]//span[contains(@class, 'count')]",
-                "//span[contains(@class, 'like')]/following-sibling::span",
-                "//*[contains(@class, 'like-wrapper')]//span",
-                "//button[contains(@class, 'like')]//span",
+            # === 좋아요/즐겨찾기/댓글 (최신 구조: engage-bar) ===
+            # 최신 샤오홍슈는 engage-bar 안에 상호작용 버튼이 있음
+            engage_bar_selectors = [
+                # 좋아요
+                ("likes", [
+                    "//div[contains(@class, 'engage-bar')]//span[contains(@class, 'like-wrapper')]//span[contains(@class, 'count')]",
+                    "//div[contains(@class, 'engage-bar')]//div[contains(@class, 'like')]//span",
+                    "//button[contains(@class, 'like')]//span[contains(@class, 'count')]",
+                    "//span[contains(@class, 'like-count')]",
+                ]),
+                # 즐겨찾기
+                ("favorites", [
+                    "//div[contains(@class, 'engage-bar')]//span[contains(@class, 'collect-wrapper')]//span[contains(@class, 'count')]",
+                    "//div[contains(@class, 'engage-bar')]//div[contains(@class, 'collect')]//span",
+                    "//button[contains(@class, 'collect')]//span[contains(@class, 'count')]",
+                    "//span[contains(@class, 'collect-count')]",
+                ]),
+                # 댓글
+                ("comments", [
+                    "//div[contains(@class, 'engage-bar')]//span[contains(@class, 'chat-wrapper')]//span[contains(@class, 'count')]",
+                    "//div[contains(@class, 'engage-bar')]//div[contains(@class, 'chat')]//span",
+                    "//span[contains(@class, 'comment-count')]",
+                    "//div[contains(@class, 'comments')]//span[contains(@class, 'total')]",
+                ]),
             ]
-            for selector in like_selectors:
-                try:
-                    like_elem = self.driver.find_element(By.XPATH, selector)
-                    result["likes"] = self._parse_count(like_elem.text)
-                    if result["likes"] > 0:
-                        break
-                except NoSuchElementException:
-                    continue
 
-            # === 즐겨찾기/수집 수 ===
-            favorite_selectors = [
-                "//span[contains(@class, 'collect-count')]",
-                "//span[contains(@class, 'count') and preceding-sibling::*[contains(@class, 'collect')]]",
-                "//div[contains(@class, 'collect')]//span[contains(@class, 'count')]",
-                "//*[contains(@class, 'collect-wrapper')]//span",
-                "//button[contains(@class, 'collect')]//span",
-                "//span[contains(@class, 'star')]/following-sibling::span",
-            ]
-            for selector in favorite_selectors:
-                try:
-                    fav_elem = self.driver.find_element(By.XPATH, selector)
-                    result["favorites"] = self._parse_count(fav_elem.text)
-                    if result["favorites"] > 0:
-                        break
-                except NoSuchElementException:
-                    continue
+            for metric_name, selectors in engage_bar_selectors:
+                for selector in selectors:
+                    try:
+                        elem = self.driver.find_element(By.XPATH, selector)
+                        text = elem.text.strip()
+                        # "评论" 텍스트 제거
+                        if "评论" in text:
+                            text = text.replace("评论", "").strip()
+                        count = self._parse_count(text)
+                        if count > 0:
+                            result[metric_name] = count
+                            break
+                    except NoSuchElementException:
+                        continue
 
-            # === 댓글 수 ===
-            comment_selectors = [
-                "//span[contains(@class, 'comment-count')]",
-                "//span[contains(@class, 'count') and preceding-sibling::*[contains(@class, 'comment')]]",
-                "//div[contains(@class, 'comment')]//span[contains(@class, 'count')]",
-                "//*[contains(@class, 'comment-wrapper')]//span",
-                "//button[contains(@class, 'chat')]//span",
-                "//span[contains(text(), '评论')]",
-            ]
-            for selector in comment_selectors:
-                try:
-                    comment_elem = self.driver.find_element(By.XPATH, selector)
-                    text = comment_elem.text
-                    # "评论 123" 형식 처리
-                    if "评论" in text:
-                        text = text.replace("评论", "").strip()
-                    result["comments"] = self._parse_count(text)
-                    if result["comments"] > 0:
-                        break
-                except NoSuchElementException:
-                    continue
-
-            # === 공유 수 (있는 경우) ===
+            # === 공유 수 ===
             share_selectors = [
+                "//div[contains(@class, 'engage-bar')]//span[contains(@class, 'share-wrapper')]//span[contains(@class, 'count')]",
                 "//span[contains(@class, 'share-count')]",
-                "//div[contains(@class, 'share')]//span[contains(@class, 'count')]",
-                "//*[contains(@class, 'share-wrapper')]//span",
             ]
             for selector in share_selectors:
                 try:
@@ -782,12 +906,11 @@ class XHSCrawler:
                 except NoSuchElementException:
                     continue
 
-            # === 조회수 (있는 경우) ===
+            # === 조회수 ===
             view_selectors = [
                 "//span[contains(@class, 'view-count')]",
                 "//span[contains(@class, 'read-count')]",
                 "//span[contains(text(), '浏览')]",
-                "//span[contains(text(), '阅读')]",
             ]
             for selector in view_selectors:
                 try:
@@ -798,31 +921,78 @@ class XHSCrawler:
                 except NoSuchElementException:
                     continue
 
-            # === JavaScript로 데이터 추출 시도 (백업) ===
+            # === DOM 방식도 실패 시 JavaScript로 재시도 ===
             if result["likes"] == 0 and result["favorites"] == 0:
                 try:
-                    # 페이지 내 JSON 데이터 추출 시도
+                    # noteDetailMap 구조에서 직접 데이터 추출
                     page_data = self.driver.execute_script("""
-                        // window.__INITIAL_STATE__ 또는 유사한 전역 객체에서 데이터 추출
-                        if (window.__INITIAL_STATE__) {
-                            return JSON.stringify(window.__INITIAL_STATE__);
-                        }
-                        if (window.__NUXT__) {
-                            return JSON.stringify(window.__NUXT__);
-                        }
-                        // 페이지 소스에서 JSON 데이터 찾기
-                        var scripts = document.querySelectorAll('script');
-                        for (var i = 0; i < scripts.length; i++) {
-                            var text = scripts[i].textContent;
-                            if (text.includes('noteData') || text.includes('interactInfo')) {
-                                return text;
+                        if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.note) {
+                            var noteState = window.__INITIAL_STATE__.note;
+                            var result = {};
+
+                            // noteDetailMap 구조
+                            if (noteState.noteDetailMap) {
+                                var keys = Object.keys(noteState.noteDetailMap);
+                                if (keys.length > 0) {
+                                    var noteData = noteState.noteDetailMap[keys[0]];
+                                    if (noteData && noteData.note) {
+                                        var note = noteData.note;
+                                        result.title = note.title || note.desc || '';
+
+                                        if (note.interactInfo) {
+                                            result.likes = parseInt(note.interactInfo.likedCount) || 0;
+                                            result.favorites = parseInt(note.interactInfo.collectedCount) || 0;
+                                            result.comments = parseInt(note.interactInfo.commentCount) || 0;
+                                            result.shares = parseInt(note.interactInfo.shareCount) || 0;
+                                        }
+
+                                        if (note.user) {
+                                            result.author = note.user.nickname || note.user.name || '';
+                                            result.authorId = note.user.userId || note.user.uid || '';
+                                        }
+                                    }
+                                }
                             }
+
+                            // 구버전 구조 fallback
+                            if (!result.author && noteState.note) {
+                                var note = noteState.note;
+                                result.title = note.title || note.desc || '';
+                                result.likes = parseInt(note.likedCount) || 0;
+                                result.favorites = parseInt(note.collectedCount) || 0;
+                                result.comments = parseInt(note.commentCount) || 0;
+
+                                if (note.user) {
+                                    result.author = note.user.nickname || '';
+                                    result.authorId = note.user.userId || '';
+                                }
+                            }
+
+                            return result;
                         }
                         return null;
                     """)
 
                     if page_data:
-                        self._parse_json_data(page_data, result)
+                        # JavaScript에서 반환된 객체 직접 처리
+                        if isinstance(page_data, dict):
+                            if page_data.get('title'):
+                                result['title'] = page_data['title']
+                            if page_data.get('likes'):
+                                result['likes'] = int(page_data['likes'])
+                            if page_data.get('favorites'):
+                                result['favorites'] = int(page_data['favorites'])
+                            if page_data.get('comments'):
+                                result['comments'] = int(page_data['comments'])
+                            if page_data.get('shares'):
+                                result['shares'] = int(page_data['shares'])
+                            if page_data.get('author'):
+                                result['author'] = page_data['author']
+                            if page_data.get('authorId'):
+                                result['author_id'] = page_data['authorId']
+                            logger.info(f"JavaScript 객체에서 데이터 추출 성공: likes={result['likes']}, author={result['author']}")
+                        elif isinstance(page_data, str):
+                            self._parse_json_data(page_data, result)
 
                 except Exception as e:
                     logger.debug(f"JavaScript 데이터 추출 실패: {e}")
@@ -842,36 +1012,77 @@ class XHSCrawler:
         JSON 데이터에서 정보 추출
 
         Args:
-            json_str: JSON 문자열
+            json_str: JSON 문자열 또는 딕셔너리
             result: 결과 딕셔너리 (업데이트됨)
         """
         try:
-            # JSON 객체 찾기
-            json_match = re.search(r'\{[^{}]*"likedCount"[^{}]*\}', json_str)
-            if json_match:
-                data = json.loads(json_match.group())
-                if "likedCount" in data:
-                    result["likes"] = int(data["likedCount"])
-                if "collectedCount" in data:
-                    result["favorites"] = int(data["collectedCount"])
-                if "commentCount" in data:
-                    result["comments"] = int(data["commentCount"])
-                if "shareCount" in data:
-                    result["shares"] = int(data["shareCount"])
-                return
+            # 이미 딕셔너리인 경우
+            if isinstance(json_str, dict):
+                data = json_str
+            else:
+                # JSON 문자열 파싱 시도
+                try:
+                    data = json.loads(json_str)
+                except json.JSONDecodeError:
+                    data = None
 
-            # 다른 형식 시도
-            patterns = [
-                (r'"liked[_]?[cC]ount"\s*:\s*(\d+)', "likes"),
-                (r'"collected[_]?[cC]ount"\s*:\s*(\d+)', "favorites"),
-                (r'"comment[_]?[cC]ount"\s*:\s*(\d+)', "comments"),
-                (r'"share[_]?[cC]ount"\s*:\s*(\d+)', "shares"),
-            ]
+            if data:
+                # noteDetailMap 구조 처리
+                note_detail_map = data.get('note', {}).get('noteDetailMap', {})
+                if note_detail_map:
+                    for key, value in note_detail_map.items():
+                        if isinstance(value, dict) and 'note' in value:
+                            note = value.get('note', {})
+                            interact_info = note.get('interactInfo', {})
+                            if interact_info:
+                                result['likes'] = int(interact_info.get('likedCount', 0) or 0)
+                                result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
+                                result['comments'] = int(interact_info.get('commentCount', 0) or 0)
+                                result['shares'] = int(interact_info.get('shareCount', 0) or 0)
 
-            for pattern, key in patterns:
-                match = re.search(pattern, json_str, re.IGNORECASE)
-                if match:
-                    result[key] = int(match.group(1))
+                            user = note.get('user', {})
+                            if user:
+                                result['author'] = user.get('nickname') or user.get('name')
+                                result['author_id'] = user.get('userId') or user.get('uid')
+
+                            result['title'] = note.get('title') or note.get('desc')
+                            return
+
+                # interactInfo 직접 찾기
+                if 'interactInfo' in str(data):
+                    interact_info = data.get('interactInfo', {})
+                    if interact_info:
+                        result['likes'] = int(interact_info.get('likedCount', 0) or 0)
+                        result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
+                        result['comments'] = int(interact_info.get('commentCount', 0) or 0)
+                        result['shares'] = int(interact_info.get('shareCount', 0) or 0)
+                        return
+
+            # 문자열에서 정규식으로 추출
+            if isinstance(json_str, str):
+                # interactInfo 내부 데이터 우선
+                patterns = [
+                    (r'"interactInfo"[^}]*"likedCount"\s*:\s*"?(\d+)"?', "likes"),
+                    (r'"interactInfo"[^}]*"collectedCount"\s*:\s*"?(\d+)"?', "favorites"),
+                    (r'"interactInfo"[^}]*"commentCount"\s*:\s*"?(\d+)"?', "comments"),
+                    (r'"interactInfo"[^}]*"shareCount"\s*:\s*"?(\d+)"?', "shares"),
+                    (r'"likedCount"\s*:\s*"?(\d+)"?', "likes"),
+                    (r'"collectedCount"\s*:\s*"?(\d+)"?', "favorites"),
+                    (r'"commentCount"\s*:\s*"?(\d+)"?', "comments"),
+                    (r'"shareCount"\s*:\s*"?(\d+)"?', "shares"),
+                ]
+
+                for pattern, key in patterns:
+                    if result.get(key, 0) == 0:  # 아직 값이 없는 경우만
+                        match = re.search(pattern, json_str, re.IGNORECASE)
+                        if match:
+                            result[key] = int(match.group(1))
+
+                # 작성자 추출 (noteDetailMap 내 user)
+                if not result.get('author'):
+                    author_match = re.search(r'"user"\s*:\s*\{[^}]*"nickname"\s*:\s*"([^"]+)"', json_str)
+                    if author_match:
+                        result['author'] = author_match.group(1)
 
         except Exception as e:
             logger.debug(f"JSON 파싱 실패: {e}")
@@ -902,14 +1113,22 @@ class XHSCrawler:
         if not url or "xiaohongshu.com" not in url and "xhslink.com" not in url:
             raise ValueError(f"유효하지 않은 샤오홍슈 URL: {url}")
 
-        # 1. API 방식 우선 시도 (Cloud 환경에서 효과적)
-        if self.use_api and self.session:
-            logger.info("requests API로 크롤링 시도...")
-            result = self._crawl_via_api(url)
-            if result and (result.get('likes', 0) > 0 or result.get('favorites', 0) > 0 or result.get('author')):
-                logger.info(f"API 크롤링 성공: likes={result.get('likes')}, favorites={result.get('favorites')}")
-                return result
-            logger.info("API 방식 실패, Selenium fallback 시도...")
+        # 인증 모드 (headless=False)일 때는 바로 Selenium으로 (QR 로그인용)
+        if not self.headless and not IS_CLOUD:
+            print("[샤오홍슈] 인증 모드 - 브라우저 창을 여는 중...")
+            logger.info("인증 모드 활성화 - Selenium으로 직접 크롤링 (API 스킵)")
+            # Selenium으로 직접 진행
+        else:
+            # 1. API 방식 우선 시도 (Cloud 환경에서 효과적)
+            if self.use_api and self.session:
+                print("[샤오홍슈] API로 크롤링 시도 중...")
+                logger.info("requests API로 크롤링 시도...")
+                result = self._crawl_via_api(url)
+                if result and (result.get('likes', 0) > 0 or result.get('favorites', 0) > 0 or result.get('author')):
+                    logger.info(f"API 크롤링 성공: likes={result.get('likes')}, favorites={result.get('favorites')}")
+                    return result
+                print("[샤오홍슈] API 실패, 브라우저 모드로 전환...")
+                logger.info("API 방식 실패, Selenium fallback 시도...")
 
         # 2. Cloud 환경에서 API 실패 시 - 제한적 응답 반환 (QR 인증 불가)
         if IS_CLOUD:
@@ -925,16 +1144,22 @@ class XHSCrawler:
                 "shares": 0,
                 "views": None,
                 "crawled_at": datetime.now().isoformat(),
-                "error": "cloud_qr_auth_required",
+                "error": "QR 인증이 필요합니다. 로컬 환경에서 실행하거나 쿠키를 설정해주세요.",
             }
 
         # 3. Selenium fallback (로컬 환경)
         if self.driver is None:
+            print("[샤오홍슈] Chrome 브라우저 시작 중...")
+            logger.info("Chrome WebDriver 생성 중...")
             self.driver = self._create_driver()
+            print("[샤오홍슈] 브라우저 창이 열렸습니다.")
 
         # 로그인 확인 및 수행
         if not self.is_logged_in and auto_login:
+            print("[샤오홍슈] QR 코드 로그인을 시작합니다...")
+            print("[샤오홍슈] 브라우저 창에서 QR 코드를 스캔하세요. (최대 2분)")
             self.login()
+            print("[샤오홍슈] 로그인 완료!")
 
         # 게시물 데이터 추출
         return self._extract_post_data(url)
