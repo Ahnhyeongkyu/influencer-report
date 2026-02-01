@@ -29,6 +29,8 @@ PLATFORM_PATTERNS: Dict[str, List[str]] = {
         r"instagram\.com/p/",
         r"instagram\.com/reel/",
         r"instagram\.com/tv/",
+        r"instagram\.com/[^/]+/p/",  # /{username}/p/{shortcode} 형식
+        r"instagram\.com/[^/]+/reel/",  # /{username}/reel/{shortcode} 형식
     ],
     "facebook": [
         r"facebook\.com",

@@ -18,11 +18,12 @@ import logging
 import streamlit as st
 from typing import Dict, Optional
 from pathlib import Path
+from selenium import webdriver
 
 # undetected_chromedriver for browser login
 try:
     import undetected_chromedriver as uc
-    HAS_UNDETECTED = True
+    HAS_UNDETECTED = False  # ChromeDriver 버전 충돌 방지
 except ImportError:
     HAS_UNDETECTED = False
 
@@ -102,6 +103,11 @@ def get_platform_cookies(platform: str) -> Dict[str, str]:
         쿠키 딕셔너리
     """
     init_platform_auth_state()
+    # 세션에 없으면 파일에서 로드
+    if platform not in st.session_state.platform_cookies or not st.session_state.platform_cookies[platform]:
+        file_cookies = load_cookies_from_file(platform)
+        if file_cookies:
+            st.session_state.platform_cookies[platform] = file_cookies
     return st.session_state.platform_cookies.get(platform, {})
 
 
@@ -185,11 +191,11 @@ def render_platform_cookie_input(platform: str):
     # 인증 상태 표시
     is_auth = is_platform_authenticated(platform)
     if is_auth and current_cookies:
-        st.success("✅ 로그인됨 - 크롤링 준비 완료")
+        st.success("✅ 쿠키 설정됨")
         # 저장된 쿠키 정보 간략히 표시
         cookie_names = list(current_cookies.keys())[:3]
         st.caption(f"저장된 쿠키: {', '.join(cookie_names)}")
-        st.caption("💡 쿠키가 만료된 경우에만 다시 로그인하세요.")
+        st.warning("⚠️ 쿠키는 만료될 수 있습니다. 크롤링 실패 시 다시 로그인하세요.")
     elif config.get("required_cookies"):
         st.warning("⚠️ 로그인 필요")
     else:
@@ -211,25 +217,21 @@ def render_platform_cookie_input(platform: str):
                 use_container_width=True,
                 type="primary"
             ):
-                if not HAS_UNDETECTED:
-                    st.error("❌ undetected_chromedriver가 설치되지 않았습니다. 설치.bat을 다시 실행해주세요.")
-                    st.code("pip install undetected-chromedriver", language="bash")
-                else:
-                    st.info(f"🌐 {config.get('display_name')} 로그인 창을 여는 중...")
-                    st.warning("⚠️ Chrome 브라우저 창이 열립니다. 로그인 완료 후 자동으로 저장됩니다. (최대 2분)")
+                st.info(f"🌐 {config.get('display_name')} 로그인 창을 여는 중...")
+                st.warning("⚠️ Chrome 브라우저 창이 열립니다. 로그인 완료 후 자동으로 저장됩니다. (최대 2분)")
 
-                    try:
-                        cookies = browser_login(platform, timeout=120)
-                        if cookies:
-                            set_platform_cookies(platform, cookies)
-                            save_cookies_to_file(platform, cookies)
-                            st.success(f"✅ 로그인 성공! 쿠키 {len(cookies)}개 저장됨")
-                            st.rerun()
-                        else:
-                            st.error("❌ 로그인 타임아웃. 2분 내에 로그인을 완료해주세요.")
-                    except Exception as e:
-                        st.error(f"❌ 브라우저 로그인 오류: {str(e)}")
-                        st.info("💡 Chrome 브라우저가 설치되어 있는지 확인해주세요.")
+                try:
+                    cookies = browser_login(platform, timeout=120)
+                    if cookies:
+                        set_platform_cookies(platform, cookies)
+                        save_cookies_to_file(platform, cookies)
+                        st.success(f"✅ 로그인 성공! 쿠키 {len(cookies)}개 저장됨")
+                        st.rerun()
+                    else:
+                        st.error("❌ 로그인 타임아웃. 2분 내에 로그인을 완료해주세요.")
+                except Exception as e:
+                    st.error(f"❌ 브라우저 로그인 오류: {str(e)}")
+                    st.info("💡 Chrome 브라우저가 설치되어 있는지 확인해주세요.")
 
     elif platform == "xiaohongshu":
         if not (is_auth and current_cookies):
@@ -387,16 +389,17 @@ def browser_login(platform: str, timeout: int = 120) -> Dict[str, str]:
     Returns:
         저장된 쿠키 딕셔너리
     """
-    if not HAS_UNDETECTED:
-        raise RuntimeError("undetected_chromedriver가 설치되지 않았습니다")
-
     login_url = PLATFORM_LOGIN_URLS.get(platform)
     if not login_url:
         raise ValueError(f"지원하지 않는 플랫폼: {platform}")
 
     logger.info(f"{platform} 브라우저 로그인 시작")
 
-    options = uc.ChromeOptions()
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    options = Options()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
@@ -415,7 +418,8 @@ def browser_login(platform: str, timeout: int = 120) -> Dict[str, str]:
         logger.info("Chrome 브라우저 시작 중...")
         print(f"[browser_login] Chrome 브라우저 시작 중... ({platform})")
 
-        driver = uc.Chrome(options=options, use_subprocess=True)
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
 
         logger.info(f"브라우저 열림, 로그인 페이지로 이동: {login_url}")
         print(f"[browser_login] 로그인 페이지로 이동: {login_url}")

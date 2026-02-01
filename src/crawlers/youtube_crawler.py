@@ -71,6 +71,8 @@ class YouTubeCrawler:
         api_key: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
         request_delay: float = REQUEST_DELAY,
+        collect_comments: bool = True,  # 댓글 내용 수집 여부
+        max_comments: int = 10,  # 수집할 최대 댓글 수
     ):
         """
         크롤러 초기화
@@ -79,10 +81,14 @@ class YouTubeCrawler:
             api_key: YouTube Data API v3 키 (선택적, 현재 미사용)
             timeout: 요청 타임아웃 (초)
             request_delay: 요청 간 딜레이 (초)
+            collect_comments: 댓글 내용 수집 여부
+            max_comments: 수집할 최대 댓글 수
         """
         self.api_key = api_key
         self.timeout = timeout
         self.request_delay = request_delay
+        self.collect_comments = collect_comments
+        self.max_comments = max_comments
 
         # yt-dlp 옵션 설정
         self._ydl_opts = {
@@ -102,21 +108,45 @@ class YouTubeCrawler:
             },
         }
 
-        self._ydl = None
-        logger.info("YouTubeCrawler 초기화 완료")
+        # 댓글 수집용 yt-dlp 옵션
+        self._ydl_opts_with_comments = {
+            **self._ydl_opts,
+            'getcomments': True,
+            'extractor_args': {
+                'youtube': {
+                    'max_comments': [str(max_comments)],
+                    'comment_sort': ['top'],  # 인기순 댓글
+                }
+            }
+        }
 
-    def _get_ydl(self):
-        """yt-dlp 인스턴스 가져오기 (지연 로딩)"""
-        if self._ydl is None:
-            try:
-                import yt_dlp
-                self._ydl = yt_dlp.YoutubeDL(self._ydl_opts)
-            except ImportError:
-                raise YouTubeCrawlerError(
-                    "yt-dlp가 설치되지 않았습니다. "
-                    "'pip install yt-dlp' 명령으로 설치해주세요."
-                )
-        return self._ydl
+        self._ydl = None
+        self._ydl_comments = None
+        logger.info(f"YouTubeCrawler 초기화 완료 (collect_comments={collect_comments})")
+
+    def _get_ydl(self, with_comments: bool = False):
+        """yt-dlp 인스턴스 가져오기 (지연 로딩)
+
+        Args:
+            with_comments: 댓글 수집 옵션 포함 여부
+        """
+        try:
+            import yt_dlp
+
+            if with_comments:
+                if self._ydl_comments is None:
+                    self._ydl_comments = yt_dlp.YoutubeDL(self._ydl_opts_with_comments)
+                return self._ydl_comments
+            else:
+                if self._ydl is None:
+                    self._ydl = yt_dlp.YoutubeDL(self._ydl_opts)
+                return self._ydl
+
+        except ImportError:
+            raise YouTubeCrawlerError(
+                "yt-dlp가 설치되지 않았습니다. "
+                "'pip install yt-dlp' 명령으로 설치해주세요."
+            )
 
     def _extract_video_id(self, url: str) -> Optional[str]:
         """
@@ -198,13 +228,39 @@ class YouTubeCrawler:
         Returns:
             동영상 메타데이터
         """
-        ydl = self._get_ydl()
+        # 먼저 기본 정보 추출 (댓글 없이) - comment_count를 정확히 얻기 위함
+        # getcomments + max_comments 옵션 사용 시 comment_count가 수집된 댓글 수로 제한됨
+        ydl_basic = self._get_ydl(with_comments=False)
 
         try:
-            info = ydl.extract_info(url, download=False)
+            info = ydl_basic.extract_info(url, download=False)
 
             if info is None:
                 raise YouTubeVideoNotFoundError(f"동영상 정보를 가져올 수 없습니다: {url}")
+
+            # 실제 총 댓글 수 저장 (getcomments 옵션 없이 가져온 값)
+            total_comment_count = self._parse_count(info.get("comment_count"))
+
+            # 댓글 내용 수집이 필요한 경우 별도로 가져오기
+            comments_list = []
+            if self.collect_comments:
+                try:
+                    ydl_comments = self._get_ydl(with_comments=True)
+                    info_with_comments = ydl_comments.extract_info(url, download=False)
+                    if info_with_comments and info_with_comments.get("comments"):
+                        raw_comments = info_with_comments.get("comments", [])
+                        for comment in raw_comments[:self.max_comments]:
+                            comment_data = {
+                                "author": comment.get("author", "익명"),
+                                "text": comment.get("text", ""),
+                                "likes": self._parse_count(comment.get("like_count", 0)),
+                                "timestamp": comment.get("timestamp"),
+                            }
+                            if comment_data["text"]:  # 빈 댓글 제외
+                                comments_list.append(comment_data)
+                        logger.info(f"댓글 {len(comments_list)}개 수집됨")
+                except Exception as e:
+                    logger.warning(f"댓글 수집 중 오류 (무시): {e}")
 
             return {
                 "platform": "youtube",
@@ -216,7 +272,7 @@ class YouTubeCrawler:
                 "title": info.get("title"),
                 "description": info.get("description", "")[:500] if info.get("description") else None,
                 "likes": self._parse_count(info.get("like_count")),
-                "comments": self._parse_count(info.get("comment_count")),
+                "comments": total_comment_count,  # 실제 총 댓글 수 사용
                 "views": self._parse_count(info.get("view_count")),
                 "subscribers": self._parse_count(info.get("channel_follower_count")),
                 "duration": info.get("duration"),  # 초 단위
@@ -225,6 +281,7 @@ class YouTubeCrawler:
                 "categories": info.get("categories", []),
                 "tags": info.get("tags", []),
                 "is_live": info.get("is_live", False),
+                "comments_list": comments_list,  # 댓글 내용 리스트
                 "crawled_at": datetime.now().isoformat(),
             }
 
@@ -260,9 +317,40 @@ class YouTubeCrawler:
                 "crawled_at": str
             }
         """
-        # URL 유효성 검사
+        # URL 유효성 검사 - ValueError 대신 에러 dict 반환 (verify-bot 프로토콜)
+        if not url:
+            logger.error("URL이 비어있습니다")
+            return {
+                "platform": "youtube",
+                "url": url or "",
+                "video_id": None,
+                "author": None,
+                "title": None,
+                "likes": 0,
+                "comments": 0,
+                "views": 0,
+                "subscribers": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": "URL이 비어있습니다.",
+                "error_type": "validation_error"
+            }
+
         if not self._validate_url(url):
-            raise ValueError(f"유효하지 않은 YouTube URL: {url}")
+            logger.error(f"유효하지 않은 YouTube URL: {url}")
+            return {
+                "platform": "youtube",
+                "url": url,
+                "video_id": None,
+                "author": None,
+                "title": None,
+                "likes": 0,
+                "comments": 0,
+                "views": 0,
+                "subscribers": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": "유효하지 않은 YouTube URL입니다. youtube.com 또는 youtu.be URL을 입력해주세요.",
+                "error_type": "validation_error"
+            }
 
         logger.info(f"YouTube 동영상 크롤링 시작: {url}")
 
@@ -353,6 +441,12 @@ class YouTubeCrawler:
             except Exception:
                 pass
             self._ydl = None
+        if self._ydl_comments is not None:
+            try:
+                self._ydl_comments.close()
+            except Exception:
+                pass
+            self._ydl_comments = None
         logger.info("YouTubeCrawler 종료")
 
     def __enter__(self):

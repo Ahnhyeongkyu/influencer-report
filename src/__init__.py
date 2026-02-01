@@ -7,5 +7,5 @@
 - app: Streamlit 웹 애플리케이션
 """
 
-__version__ = "1.0.0"
+__version__ = "1.5.8"
 __author__ = "Fixup Team"

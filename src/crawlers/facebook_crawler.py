@@ -11,6 +11,7 @@ Streamlit Cloud 호환:
 - Selenium fallback 지원 (로컬 환경용)
 """
 
+import html as html_module
 import json
 import logging
 import os
@@ -33,20 +34,25 @@ def decode_unicode_escapes(text: str) -> str:
     if not text:
         return text
     try:
-        # 방법 1: Python 내장 decode 사용 (surrogate pair 자동 처리)
-        try:
-            decoded = text.encode('utf-8').decode('unicode_escape')
-            # surrogate pair가 있으면 UTF-16으로 재인코딩하여 해결
-            decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            # fallback: 수동 변환
-            def replace_unicode(match):
-                return chr(int(match.group(1), 16))
-            decoded = re.sub(r'\\u([0-9a-fA-F]{4})', replace_unicode, text)
+        # 정규식으로 \uXXXX 패턴을 직접 변환 (가장 안정적)
+        def replace_unicode(match):
             try:
+                return chr(int(match.group(1), 16))
+            except ValueError:
+                return match.group(0)
+
+        # \uXXXX 패턴 변환
+        decoded = re.sub(r'\\u([0-9a-fA-F]{4})', replace_unicode, text)
+
+        # surrogate pair 처리 (이모지 등)
+        # \uD83D\uDE00 같은 surrogate pair를 실제 문자로 변환
+        try:
+            # surrogate가 있는지 확인
+            if '\ud800' <= decoded <= '\udfff' or any('\ud800' <= c <= '\udfff' for c in decoded):
                 decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-            except:
-                pass
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+
         # 추가 이스케이프 처리
         decoded = decoded.replace('\\n', '\n').replace('\\r', '\r')
         decoded = decoded.replace('\\t', '\t').replace('\\"', '"')
@@ -77,12 +83,13 @@ from selenium.common.exceptions import (
     StaleElementReferenceException,
 )
 
-# undetected_chromedriver for bot detection bypass
+# undetected_chromedriver 비활성화 (ChromeDriver 버전 충돌 문제)
+# webdriver-manager 사용으로 대체
+HAS_UNDETECTED = False
 try:
     import undetected_chromedriver as uc
-    HAS_UNDETECTED = True
 except ImportError:
-    HAS_UNDETECTED = False
+    uc = None
 
 # Streamlit Cloud 환경 감지
 IS_CLOUD = platform.system() == "Linux" and os.path.exists("/etc/debian_version")
@@ -323,17 +330,54 @@ class FacebookCrawler:
                         result["author"] = author_candidate
                         break
 
-            # 썸네일 이미지 추출 (og:image 메타 태그)
-            thumbnail_patterns = [
-                r'<meta\s+property="og:image"\s+content="([^"]+)"',
-                r'<meta\s+content="([^"]+)"\s+property="og:image"',
-                r'<img[^>]+src="(https://[^"]+fbcdn[^"]+)"',  # Facebook CDN 이미지
-            ]
-            for pattern in thumbnail_patterns:
-                match = re.search(pattern, html)
-                if match:
-                    result["thumbnail"] = match.group(1)
-                    break
+            # 페이스북 썸네일 비활성화 (정확한 게시물 이미지 추출 불가 - v1.5.5에서 개선 예정)
+
+            # mbasic HTML에서 댓글 내용 추출
+            try:
+                comments_list = []
+                # mbasic 댓글 패턴: <h3> 작성자 </h3> 다음에 댓글 텍스트
+                # 또는 <a> 작성자 </a> 텍스트 구조
+                comment_blocks = re.findall(
+                    r'<div[^>]*id="[^"]*comment[^"]*"[^>]*>(.*?)</div>\s*</div>',
+                    html, re.DOTALL | re.IGNORECASE
+                )
+                if not comment_blocks:
+                    # 대안 패턴: mbasic 댓글 영역
+                    comment_blocks = re.findall(
+                        r'<div[^>]*>\s*<h3[^>]*><a[^>]*>([^<]+)</a></h3>\s*(.*?)\s*<div',
+                        html, re.DOTALL | re.IGNORECASE
+                    )
+                    for author_match, text_match in comment_blocks[:10]:
+                        text = re.sub(r'<[^>]+>', '', text_match).strip()
+                        if text and len(text) > 1 and author_match:
+                            if not any(c.get('text') == text for c in comments_list):
+                                comments_list.append({
+                                    'author': author_match.strip(),
+                                    'text': text[:500]
+                                })
+                else:
+                    for block in comment_blocks[:10]:
+                        author_m = re.search(r'<a[^>]*>([^<]+)</a>', block)
+                        text_clean = re.sub(r'<[^>]+>', ' ', block).strip()
+                        # 작성자 이름 제거
+                        if author_m:
+                            author = author_m.group(1).strip()
+                            text_clean = text_clean.replace(author, '', 1).strip()
+                        else:
+                            author = None
+                        # 불필요한 텍스트 제거
+                        text_clean = re.sub(r'(좋아요|답글|Like|Reply|댓글|·|\d+시간|\d+분|\d+일)\s*', '', text_clean).strip()
+                        if text_clean and len(text_clean) > 1:
+                            if not any(c.get('text') == text_clean[:200] for c in comments_list):
+                                comments_list.append({
+                                    'author': author,
+                                    'text': text_clean[:500]
+                                })
+                if comments_list:
+                    result["comments_list"] = comments_list
+                    logger.info(f"mbasic HTML에서 댓글 {len(comments_list)}개 추출")
+            except Exception as e:
+                logger.debug(f"mbasic 댓글 추출 실패: {e}")
 
             return result if result.get('likes', 0) > 0 or result.get('author') else None
 
@@ -354,12 +398,15 @@ class FacebookCrawler:
         # 다양한 URL 패턴 처리
         patterns = [
             r'/posts/(\d+)',  # /posts/123456
+            r'/posts/(pfbid\w+)',  # /posts/pfbid0abc123...
             r'/(\d+)/?$',  # 끝의 숫자
             r'fbid=(\d+)',  # fbid=123456
             r'story_fbid=(\d+)',  # story_fbid=123456
             r'/permalink/(\d+)',  # /permalink/123456
             r'/videos/(\d+)',  # /videos/123456
             r'/photos/[^/]+/(\d+)',  # /photos/xxx/123456
+            r'[?&]v=(\d+)',  # /watch/?v=123456
+            r'/reel/(\d+)',  # /reel/123456
         ]
 
         for pattern in patterns:
@@ -417,13 +464,21 @@ class FacebookCrawler:
 
             logger.info(f"facebook-scraper로 크롤링: page={page_name}, post_id={post_id}")
 
+            # 쿠키 파일 경로 (저장된 쿠키 사용)
+            cookie_file = str(self.cookie_file) if self.cookie_file.exists() else None
+            if cookie_file:
+                logger.info(f"facebook-scraper에 쿠키 적용: {cookie_file}")
+
             # get_posts로 특정 게시물 가져오기
             posts = get_posts(
                 page_name,
                 pages=1,
+                cookies=cookie_file,  # 쿠키 파일 전달
                 options={
                     "posts_per_page": 10,
-                    "allow_extra_requests": False,
+                    "allow_extra_requests": True,
+                    "comments": 20,  # 댓글 최대 20개 수집
+                    "reactors": False,
                 }
             )
 
@@ -456,15 +511,27 @@ class FacebookCrawler:
         Returns:
             표준화된 게시물 데이터
         """
+        # 댓글 목록 추출
+        comments_list = []
+        raw_comments = post.get('comments_full') or []
+        for c in raw_comments[:20]:
+            text = c.get('comment_text', '') if isinstance(c, dict) else str(c)
+            if text:
+                comments_list.append(text[:200])
+
+        # 댓글 수: comments_full 길이 우선, 없으면 comments 필드
+        comment_count = len(raw_comments) if raw_comments else (post.get('comments', 0) or 0)
+
         return {
             "platform": "facebook",
             "url": url,
             "author": post.get('username') or post.get('user_id') or "Unknown",
             "content": (post.get('text') or "")[:500],
             "likes": post.get('likes', 0) or post.get('reactions', 0) or 0,
-            "comments": post.get('comments', 0) or 0,
+            "comments": comment_count,
             "shares": post.get('shares', 0) or 0,
             "views": post.get('video_views'),
+            "comments_list": comments_list,
             "crawled_at": datetime.now().isoformat(),
         }
 
@@ -477,15 +544,44 @@ class FacebookCrawler:
         """
         # 로컬 환경에서 undetected_chromedriver 사용 (Facebook 봇 탐지 우회에 효과적)
         if HAS_UNDETECTED and not IS_CLOUD:
-            logger.info("undetected_chromedriver 사용")
-            uc_options = uc.ChromeOptions()
-            uc_options.add_argument("--no-sandbox")
-            uc_options.add_argument("--disable-dev-shm-usage")
-            if self.headless:
-                uc_options.add_argument("--headless=new")
-            driver = uc.Chrome(options=uc_options, use_subprocess=True)
-            logger.info("Stealth Chrome WebDriver 생성 완료 (undetected)")
-            return driver
+            try:
+                logger.info("undetected_chromedriver 사용")
+                uc_options = uc.ChromeOptions()
+                uc_options.add_argument("--no-sandbox")
+                uc_options.add_argument("--disable-dev-shm-usage")
+                if self.headless:
+                    uc_options.add_argument("--headless=new")
+                # Chrome 버전 자동 감지
+                chrome_ver = None
+                try:
+                    import subprocess as _sp
+                    _r = _sp.run(['reg', 'query', r'HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon', '/v', 'version'],
+                               capture_output=True, text=True, timeout=5)
+                    if _r.returncode == 0:
+                        for _line in _r.stdout.split('\n'):
+                            if 'version' in _line.lower():
+                                chrome_ver = int(_line.strip().split()[-1].split('.')[0])
+                except Exception:
+                    pass
+                driver = uc.Chrome(options=uc_options, use_subprocess=True, version_main=chrome_ver)
+                logger.info(f"Stealth Chrome WebDriver 생성 완료 (undetected, ver={chrome_ver})")
+                return driver
+            except Exception as e:
+                logger.warning(f"undetected_chromedriver 실패: {e}, webdriver-manager로 fallback")
+                # webdriver-manager fallback
+                try:
+                    # ChromeDriverManager는 파일 상단에서 이미 import됨
+                    options = Options()
+                    options.add_argument("--no-sandbox")
+                    options.add_argument("--disable-dev-shm-usage")
+                    if self.headless:
+                        options.add_argument("--headless=new")
+                    service = Service(ChromeDriverManager().install())
+                    driver = webdriver.Chrome(service=service, options=options)
+                    logger.info("webdriver-manager로 Chrome 생성 완료")
+                    return driver
+                except Exception as e2:
+                    logger.error(f"webdriver-manager도 실패: {e2}")
 
         # Cloud 환경 또는 undetected 없는 경우 기존 로직
         options = Options()
@@ -860,12 +956,10 @@ class FacebookCrawler:
         if not self.use_mobile:
             return url
 
-        # www.facebook.com -> m.facebook.com
+        # m.facebook.com 모바일 버전 사용
         url = url.replace("www.facebook.com", "m.facebook.com")
         url = url.replace("web.facebook.com", "m.facebook.com")
-
-        # mbasic 버전으로 변환 (더 가벼움)
-        # url = url.replace("m.facebook.com", "mbasic.facebook.com")
+        url = url.replace("mbasic.facebook.com", "m.facebook.com")
 
         return url
 
@@ -938,6 +1032,17 @@ class FacebookCrawler:
 
         return 0
 
+    def _is_time_text(self, text: str) -> bool:
+        """시간/날짜 관련 텍스트인지 판별"""
+        if not text:
+            return False
+        return bool(re.search(
+            r'\d+\s*(시간|분|일|초|주|개월|년)\s*전|'
+            r'\d+\s*(hour|min|day|sec|week|month|year)s?\s*ago|'
+            r'(어제|오늘|그저께|방금|yesterday|today|just\s*now)',
+            text, re.IGNORECASE
+        ))
+
     def _extract_reactions(self, driver: webdriver.Chrome) -> int:
         """
         반응(좋아요 등) 수 추출
@@ -948,6 +1053,32 @@ class FacebookCrawler:
         Returns:
             반응 수
         """
+        # 1단계: aria-label에서 반응 수 추출 (가장 정확)
+        # Facebook은 aria-label="좋아요 839명", "839 people reacted" 등으로 표시
+        try:
+            aria_selectors = [
+                "//*[contains(@aria-label, '좋아요') and @role='button']",
+                "//*[contains(@aria-label, '명') and (contains(@aria-label, '좋아요') or contains(@aria-label, '반응'))]",
+                "//*[contains(@aria-label, 'like') and contains(@aria-label, 'people')]",
+                "//*[contains(@aria-label, 'reaction') and @role]",
+            ]
+            for selector in aria_selectors:
+                try:
+                    elements = driver.find_elements(By.XPATH, selector)
+                    for elem in elements:
+                        aria = elem.get_attribute('aria-label') or ''
+                        if self._is_time_text(aria):
+                            continue
+                        count = self._parse_count(aria)
+                        if count > 0:
+                            logger.info(f"aria-label에서 반응 수 추출: {count} (label: {aria[:60]})")
+                            return count
+                except (NoSuchElementException, StaleElementReferenceException):
+                    continue
+        except Exception:
+            pass
+
+        # 2단계: XPath 기반 텍스트 추출 (시간 텍스트 필터링 적용)
         reaction_selectors = [
             # 모바일 버전
             "//div[contains(@data-sigil, 'reactions-sentence')]",
@@ -966,7 +1097,7 @@ class FacebookCrawler:
                 elements = driver.find_elements(By.XPATH, selector)
                 for elem in elements:
                     text = elem.text.strip()
-                    if text:
+                    if text and not self._is_time_text(text):
                         count = self._parse_count(text)
                         if count > 0:
                             return count
@@ -985,14 +1116,41 @@ class FacebookCrawler:
         Returns:
             댓글 수
         """
+        # 먼저 페이지 소스에서 정규식으로 추출 시도 (텍스트 패턴만 - JSON 패턴은 _try_javascript_extraction에서 스코핑 처리)
+        try:
+            page_source = driver.page_source
+            # 텍스트 기반 댓글 수 패턴 (DOM에 렌더링된 텍스트 - 타겟 포스트에 해당할 가능성 높음)
+            text_comment_patterns = [
+                r'(\d+)\s*(?:개의\s*)?댓글',  # "23개의 댓글", "23 댓글"
+                r'댓글\s*(\d+)',  # "댓글 23"
+                r'(\d+)\s*[Cc]omments?',  # "23 Comments", "23 comments"
+                r'[Cc]omments?\s*(\d+)',  # "Comments 23"
+                r'댓글\s*\((\d+)\)',  # "댓글(23)"
+                r'\((\d+)\)\s*댓글',  # "(23) 댓글"
+            ]
+            for pattern in text_comment_patterns:
+                match = re.search(pattern, page_source)
+                if match:
+                    count = int(match.group(1))
+                    if count > 0 and count < 1000000:
+                        logger.info(f"정규식으로 댓글 수 추출: {count}")
+                        return count
+        except Exception as e:
+            logger.debug(f"정규식 댓글 추출 실패: {e}")
+
+        # XPath 셀렉터 fallback
         comment_selectors = [
-            # 모바일 버전
-            "//a[contains(@href, 'comment')]//span",
+            # 모바일 버전 (m.facebook.com)
+            "//a[contains(@href, 'comment')]",
             "//div[contains(@data-sigil, 'comment')]",
+            "//span[contains(@class, 'comment')]",
             # 데스크톱 버전
             "//span[contains(text(), '댓글') or contains(text(), 'comment')]",
             "//a[contains(text(), '댓글')]",
             "//div[contains(@aria-label, '댓글')]",
+            # 추가 셀렉터
+            "//*[contains(text(), '개의 댓글')]",
+            "//*[contains(text(), 'Comments')]",
         ]
 
         for selector in comment_selectors:
@@ -1000,14 +1158,78 @@ class FacebookCrawler:
                 elements = driver.find_elements(By.XPATH, selector)
                 for elem in elements:
                     text = elem.text.strip()
-                    if text and ("댓글" in text or "comment" in text.lower()):
+                    if text:
                         count = self._parse_count(text)
                         if count > 0:
+                            logger.info(f"XPath로 댓글 수 추출: {count} (from: {text[:30]})")
                             return count
             except (NoSuchElementException, StaleElementReferenceException):
                 continue
 
         return 0
+
+    def _extract_comment_list(self, driver: webdriver.Chrome, max_comments: int = 10) -> list:
+        """
+        댓글 내용 추출
+
+        Args:
+            driver: WebDriver 인스턴스
+            max_comments: 최대 수집할 댓글 수
+
+        Returns:
+            댓글 리스트 [{"author": "작성자", "text": "내용"}, ...]
+        """
+        comments = []
+
+        try:
+            # 1. 페이지 소스에서 JSON으로 댓글 추출 시도
+            page_source = driver.page_source
+
+            # Facebook JSON 패턴: "body":{"text":"댓글내용"}
+            comment_pattern = r'"body"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"'
+            author_pattern = r'"name"\s*:\s*"([^"]+)"'
+
+            # 댓글 본문 추출
+            comment_texts = re.findall(comment_pattern, page_source)
+
+            if comment_texts:
+                for i, text in enumerate(comment_texts[:max_comments]):
+                    decoded_text = decode_unicode_escapes(text)
+                    comments.append({
+                        "author": f"사용자{i+1}",  # JSON에서 정확한 매칭 어려움
+                        "text": decoded_text
+                    })
+                logger.info(f"JSON에서 댓글 {len(comments)}개 추출")
+                return comments
+
+            # 2. DOM에서 댓글 요소 직접 추출
+            comment_selectors = [
+                "//div[contains(@class, 'comment')]//div[contains(@dir, 'auto')]",
+                "//div[@data-sigil='comment-body']",
+                "//div[contains(@class, '_2b05')]",  # 모바일 댓글
+                "//span[contains(@class, '_3l3x')]",  # 데스크톱 댓글
+            ]
+
+            for selector in comment_selectors:
+                try:
+                    elements = driver.find_elements(By.XPATH, selector)
+                    for elem in elements[:max_comments]:
+                        text = elem.text.strip()
+                        if text and len(text) > 1:
+                            comments.append({
+                                "author": "Facebook 사용자",
+                                "text": text
+                            })
+                    if comments:
+                        logger.info(f"DOM에서 댓글 {len(comments)}개 추출")
+                        return comments
+                except Exception:
+                    continue
+
+        except Exception as e:
+            logger.debug(f"댓글 내용 추출 실패: {e}")
+
+        return comments
 
     def _extract_shares_count(self, driver: webdriver.Chrome) -> int:
         """
@@ -1086,6 +1308,52 @@ class FacebookCrawler:
         Returns:
             작성자 이름 또는 None
         """
+        # 0. URL에서 페이지명 추출 시도 (가장 신뢰할 수 있음)
+        url_author = None  # fallback용 변수 초기화
+        try:
+            current_url = driver.current_url
+            excluded_slugs = ['profile.php', 'watch', 'groups', 'events', 'marketplace',
+                            'gaming', 'photo.php', 'video.php', 'story.php', 'permalink.php',
+                            'share', 'reel', 'login', 'checkpoint']
+            # 패턴 1: facebook.com/페이지명/posts|videos|photos|watch|reels/...
+            url_page_match = re.search(r'facebook\.com/([^/?]+)/(posts|videos|photos|watch|reels?)', current_url)
+            if url_page_match:
+                page_slug = url_page_match.group(1)
+                if page_slug not in excluded_slugs and not page_slug.isdigit():
+                    logger.info(f"URL에서 페이지명 추출 성공: {page_slug}")
+                    url_author = page_slug
+                    return page_slug
+            # 패턴 2: facebook.com/페이지명 (단순 페이지 URL)
+            if not url_author:
+                simple_match = re.search(r'facebook\.com/([^/?]+)/?$', current_url)
+                if simple_match:
+                    page_slug = simple_match.group(1)
+                    if page_slug not in excluded_slugs and not page_slug.isdigit():
+                        url_author = page_slug  # fallback으로 저장 (바로 반환하지 않음)
+        except Exception as e:
+            url_author = None
+            logger.debug(f"URL 페이지명 추출 실패: {e}")
+
+        # 쿠키 없는 requests 세션으로 작성자 추출 시도 (경량 방식 - v1.5.8)
+        try:
+            import requests as req_lib
+            current_url = driver.current_url
+            # 데스크톱 URL로 변환
+            desktop_url = current_url.replace("m.facebook.com", "www.facebook.com")
+            resp = req_lib.get(desktop_url, timeout=10, allow_redirects=True,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
+            if resp.status_code == 200:
+                temp_src = resp.text
+                # owner 패턴으로 작성자 추출
+                owner_match = re.search(r'"owner"[^}]*"name"\s*:\s*"([^"]{2,50})"', temp_src)
+                if owner_match:
+                    author = decode_unicode_escapes(owner_match.group(1))
+                    if self._is_valid_author_name(author):
+                        logger.info(f"requests 세션에서 작성자 추출: {author}")
+                        return author
+        except Exception as e:
+            logger.debug(f"requests 세션 작성자 추출 실패: {e}")
+
         page_source = driver.page_source
 
         # 0. Meta 태그에서 추출 시도 (가장 안정적)
@@ -1114,19 +1382,35 @@ class FacebookCrawler:
             title_match = re.search(r'<title>([^<]+)</title>', page_source)
             if title_match:
                 title = title_match.group(1)
-                # "영상제목 | 페이지명 | Facebook" 또는 "영상제목 | 페이지명"
-                parts = [p.strip() for p in title.split('|')]
-                if len(parts) >= 2:
-                    # 마지막이 Facebook이면 그 전 것이 페이지명
-                    if parts[-1].lower() == 'facebook' and len(parts) >= 3:
-                        author = parts[-2]
-                    elif parts[-1].lower() != 'facebook':
-                        author = parts[-1]
-                    else:
-                        author = None
-                    if author and author.lower() != 'facebook' and self._is_valid_author_name(author):
-                        logger.info(f"Title 태그에서 작성자 추출: {author}")
-                        return author
+                # 알림 숫자 제거: "(20+) ", "(99+) " 등
+                title = re.sub(r'^\(\d+\+?\)\s*', '', title)
+
+                # 패턴 1: "영상제목 | 페이지명 | Facebook" 또는 "영상제목 | 페이지명"
+                if '|' in title:
+                    parts = [p.strip() for p in title.split('|')]
+                    if len(parts) >= 2:
+                        # 마지막이 Facebook이면 그 전 것이 페이지명
+                        if parts[-1].lower() == 'facebook' and len(parts) >= 3:
+                            author = parts[-2]
+                        elif parts[-1].lower() != 'facebook':
+                            author = parts[-1]
+                        else:
+                            author = None
+                        if author and author.lower() != 'facebook' and self._is_valid_author_name(author):
+                            logger.info(f"Title 태그에서 작성자 추출 (|): {author}")
+                            return author
+
+                # 패턴 2: "(20+) 게시물 내용 - 작성자명" (일반 포스트)
+                if ' - ' in title:
+                    parts = title.rsplit(' - ', 1)  # 마지막 " - "로 분리
+                    if len(parts) == 2:
+                        author = parts[1].strip()
+                        # "| Facebook" 제거
+                        if '|' in author:
+                            author = author.split('|')[0].strip()
+                        if author and author.lower() != 'facebook' and self._is_valid_author_name(author):
+                            logger.info(f"Title 태그에서 작성자 추출 (-): {author}")
+                            return author
         except Exception as e:
             logger.debug(f"Title 작성자 추출 실패: {e}")
 
@@ -1140,7 +1424,10 @@ class FacebookCrawler:
                 logger.debug(f"로그인 사용자 감지: {logged_in_user}")
 
             author_patterns = [
-                # Watch 동영상 소유자 패턴 (가장 정확)
+                # Watch 동영상 소유자 패턴 (가장 정확) - 2026 구조
+                r'"owner"[^}]*"name"\s*:\s*"([가-힣A-Za-z][가-힣A-Za-z ]{1,29})"',
+                r'"video_owner_profile"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                r'"video_owner_profile":\{"__typename":"(?:User|Page)"[^}]*"name":"([^"]+)"',
                 r'"video_owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
                 r'"video"\s*:\s*\{[^}]*"owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
                 # 페이지 이름
@@ -1153,8 +1440,9 @@ class FacebookCrawler:
                 # owner 패턴
                 r'"owner"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"',
                 r'"owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
-                # __typename이 Page인 경우
-                r'"__typename"\s*:\s*"Page"[^}]*"name"\s*:\s*"([^"]+)"',
+                # __typename이 Page/User인 경우 (2026 최신 구조 - 중첩 객체 허용)
+                r'"__typename"\s*:\s*"Page".{0,500}"name"\s*:\s*"([^"]+)"',
+                r'"__typename"\s*:\s*"User".{0,500}"name"\s*:\s*"([^"]+)"',
                 # actor/poster
                 r'"actor"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
                 r'"poster"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
@@ -1208,6 +1496,70 @@ class FacebookCrawler:
                     return text
             except NoSuchElementException:
                 continue
+
+        # JavaScript DOM 기반 추출 (프로필 링크에서 작성자명 추출)
+        try:
+            js_code = """
+            var results = [];
+            // 1. 비디오 영역 근처의 h2, strong 내 링크 (작성자명 가능성 높음)
+            document.querySelectorAll('h2 a, strong a, [data-pagelet] a[role="link"]').forEach(function(a) {
+                var text = a.innerText.trim();
+                var href = a.href || '';
+                // 네비게이션 URL 제외
+                if (href.includes('/watch?') || href.includes('/watch/') ||
+                    href.includes('/groups') || href.includes('/events') ||
+                    href.includes('/marketplace') || href.includes('/gaming')) return;
+                if (text && text.length > 1 && text.length < 50 && !text.startsWith('#')) {
+                    results.push(text);
+                }
+            });
+            // 2. 명시적 프로필 링크
+            document.querySelectorAll('a[href*="profile.php"], a[href*="user.php"]').forEach(function(a) {
+                var text = a.innerText.trim();
+                if (text && text.length > 1 && text.length < 50) results.push(text);
+            });
+            return results.slice(0, 20);
+            """
+            link_texts = driver.execute_script(js_code)
+
+            if link_texts:
+                # 필터링: 해시태그, UI 텍스트, 날짜/시간 제외
+                ui_texts = ['좋아요', 'Like', 'Comment', 'Share', '공유', '댓글', '팔로우', 'Follow',
+                           '더 보기', 'See more', '설정', 'Settings', '메뉴', 'Menu', '검색', 'Search',
+                           '홈', 'Home', 'mome', '동영상', 'Video', 'Watch', 'Reels', '스토리', 'Stories',
+                           '알림', 'Notifications', '친구', 'Friends', '그룹', 'Groups', '페이지', 'Pages',
+                           'Sponsored', '광고', 'Facebook', 'Log In', '로그인', 'Sign Up', '가입',
+                           '둘러보기', 'Browse', 'Explore', '마켓플레이스', 'Marketplace', '이벤트', 'Events',
+                           '게임', 'Gaming', '저장됨', 'Saved', '더보기', 'See More', '접기', 'See Less',
+                           '저장된 동영상', 'Saved videos', '라이브', 'Live', '추천', 'Suggested',
+                           '피드', 'Feed', '프로필', 'Profile', '내 프로필', 'My Profile',
+                           '인기 동영상', '인기 동영상 찾아보기', 'Popular videos', 'Trending',
+                           'Messenger', '메신저', 'Create', '만들기', '새 게시물', 'New post']
+
+                for text in link_texts:
+                    # 해시태그 제외
+                    if text.startswith('#'):
+                        continue
+                    # UI 텍스트 제외
+                    if text.lower() in [u.lower() for u in ui_texts]:
+                        continue
+                    # 숫자만 있는 텍스트 제외
+                    if text.replace(',', '').replace('.', '').replace(' ', '').isdigit():
+                        continue
+                    # 날짜/시간 패턴 제외
+                    if self._is_date_time_text(text):
+                        continue
+                    # 유효한 작성자명인지 확인
+                    if self._is_valid_author_name(text):
+                        logger.info(f"JavaScript DOM에서 작성자 추출: {text}")
+                        return text
+        except Exception as e:
+            logger.debug(f"JavaScript DOM 작성자 추출 실패: {e}")
+
+        # 모든 방법 실패 시 URL에서 추출한 페이지 slug 반환
+        if url_author:
+            logger.info(f"Fallback: URL 페이지명 사용: {url_author}")
+            return url_author
 
         return None
 
@@ -1295,6 +1647,9 @@ class FacebookCrawler:
             r'^\d+일\s*전',    # 3일 전
             r'^오전\s*\d',     # 오전 5:02
             r'^오후\s*\d',     # 오후 3:00
+            r'^\d+월\s*\d+일', # 1월 20일, 12월 5일 등
+            r'^\d{4}년',       # 2025년 12월 29일 등 (년도로 시작)
+            r'년\s*\d+월',     # ~년 12월 형태
         ]
 
         # 시간 패턴 필터링 (영어/중국어/일반)
@@ -1342,6 +1697,19 @@ class FacebookCrawler:
             r'^라이브$',         # 한국어 "라이브"
             r'^릴스$',           # 한국어 "릴스"
             r'^워치$',           # 한국어 "워치"
+            r'^mome$',           # Facebook 모바일 네비게이션 요소
+            r'^home$',           # Home
+            r'^홈$',             # 한국어 "홈"
+            r'^messenger$',     # Messenger
+            r'^메신저$',         # 한국어 "메신저"
+            r'^explore$',       # Explore
+            r'^둘러보기$',       # 한국어 "둘러보기"
+            r'^create$',        # Create
+            r'^만들기$',         # 한국어 "만들기"
+            r'^notifications?$', # Notification(s)
+            r'^알림$',           # 한국어 "알림"
+            r'^search$',        # Search
+            r'^검색$',           # 한국어 "검색"
         ]
         for pattern in fb_generic_patterns:
             if re.search(pattern, name.strip(), re.IGNORECASE):
@@ -1376,8 +1744,34 @@ class FacebookCrawler:
         if re.match(r'^[\d:\s]+$', name):
             return False
 
-        # 너무 긴 이름 (보통 작성자 이름은 50자 이내)
-        if len(name) > 100:
+        # 너무 긴 이름 (보통 작성자/페이지 이름은 50자 이내)
+        if len(name) > 50:
+            return False
+
+        # 단어 수 체크: 작성자 이름은 보통 4단어 이하 (공백 4개 초과 = 문장)
+        if name.count(' ') > 4:
+            logger.debug(f"단어 수 초과로 필터링됨 (공백 {name.count(' ')}개): {name}")
+            return False
+
+        # 한국어 문장/내용 패턴 감지 (조사/어미로 끝나는 경우 - 작성자 이름이 아님)
+        sentence_endings = [
+            r'할\s*때$', r'합니다$', r'입니다$', r'습니다$', r'됩니다$',
+            r'한다$', r'된다$', r'는다$', r'인다$',
+            r'해요$', r'예요$', r'이에요$', r'세요$',
+            r'였다$', r'했다$', r'됐다$',
+            r'등\s*\d+명의$', r'\d+명의$', r'\d+개의$',
+            r'때문에$', r'에서$', r'에게$', r'로부터$',
+            r'것이다$', r'이다$', r'였다$',
+        ]
+        name_stripped = name.strip()
+        for pattern in sentence_endings:
+            if re.search(pattern, name_stripped):
+                logger.debug(f"문장 패턴으로 필터링됨: {name}")
+                return False
+
+        # "(20+) 텍스트" 패턴으로 시작하면 제목/알림이지 작성자가 아님
+        if re.match(r'^\(\d+\+?\)\s+', name):
+            logger.debug(f"알림 패턴으로 필터링됨: {name}")
             return False
 
         return True
@@ -1408,33 +1802,73 @@ class FacebookCrawler:
         Returns:
             게시물 내용 또는 None
         """
+        # 쿠키 없는 별도 세션으로 내용 추출 시도
+        try:
+            import time
+            import undetected_chromedriver as uc
+            current_url = driver.current_url
+
+            uc_options = uc.ChromeOptions()
+            uc_options.add_argument('--headless=new')
+            uc_options.add_argument('--no-sandbox')
+
+            temp_driver = uc.Chrome(options=uc_options)
+            temp_driver.get(current_url)
+            time.sleep(10)
+            temp_driver.execute_script('window.scrollTo(0, 500)')
+            time.sleep(3)
+
+            temp_src = temp_driver.page_source
+            content_patterns_temp = [
+                r'"savable_description"[^}]*"text"\s*:\s*"([^"]{10,300})"',
+                r'"message"[^}]*"text"\s*:\s*"([^"]{10,300})"',
+                r'"description"\s*:\s*"([^"]{10,300})"'
+            ]
+            for p in content_patterns_temp:
+                m = re.search(p, temp_src)
+                if m:
+                    content = m.group(1)
+                    content = self._decode_unicode_escapes(content)
+                    if len(content) > 5:
+                        logger.info(f"쿠키 없는 세션에서 내용 추출: {content[:30]}...")
+                        temp_driver.quit()
+                        return content
+            temp_driver.quit()
+        except Exception as e:
+            logger.debug(f"쿠키 없는 세션 내용 추출 실패: {e}")
+
         # 1. JSON 데이터에서 내용 추출 시도 (가장 정확)
         try:
             page_source = driver.page_source
             content_patterns = [
-                # === Watch 동영상 전용 패턴 (우선순위 높음) ===
-                r'"savable_description":\{"text":"((?:[^"\\]|\\.)*)"}',
-                r'"video_title":"((?:[^"\\]|\\.)*)"',
-                r'"title":\{"text":"((?:[^"\\]|\\.)*)"}',
-                r'"name":"((?:[^"\\]|\\.){10,500})"',  # 동영상 제목
+                # === Reel/Video 메시지 패턴 (최우선) ===
+                # Facebook Reel caption - "message":{"text":"..."} (2026 구조: 중간에 다른 필드 있음)
+                r'"message":\{[^}]*"text":"([^"]{10,500})"',
+                r'"message":\{"text":"([^"]{10,500})"',
+                # === Watch 동영상 전용 패턴 (2026 구조: ranges 등 필드 먼저 옴) ===
+                r'"savable_description":\{[^}]*"text":"([^"]{5,500})"',
+                r'"savable_description":\{"text":"([^"]{5,500})"',
+                r'"video_title":"([^"]{5,200})"',
+                r'"title":\{"text":"([^"]{5,200})"',
                 # 2026년 페이스북 Reel/Video 패턴
-                r'"attachments"[^}]*"title":"((?:[^"\\]|\\.)*)"',
-                r'"creation_story"[^}]*"message"[^}]*"text":"((?:[^"\\]|\\.)*)"',
-                # 포스트 메시지/텍스트
-                r'"message":\{"text":"((?:[^"\\]|\\.)*)"}',
-                r'"text":"((?:[^"\\]|\\.){10,500})"[^}]*"__typename":"TextWithEntities"',
-                r'"post_text":"((?:[^"\\]|\\.)*)"',
+                r'"attachments"[^}]*"title":"([^"]{5,200})"',
+                r'"creation_story"[^}]*"message"[^}]*"text":"([^"]{5,500})"',
+                # 포스트 텍스트
+                r'"text":"([^"]{10,500})"[^}]*"__typename":"TextWithEntities"',
+                r'"post_text":"([^"]{5,500})"',
                 # Watch 페이지 설명
-                r'"video"[^}]*"description":\{"text":"((?:[^"\\]|\\.)*)"}',
-                r'"description_with_entities"[^}]*"text":"((?:[^"\\]|\\.)*)"}',
-                # 캡션
-                r'"caption":"((?:[^"\\]|\\.)*)"',
-                r'"description":\{"text":"((?:[^"\\]|\\.)*)"}',
+                r'"video"[^}]*"description":\{"text":"([^"]{5,500})"',
+                r'"description_with_entities"[^}]*"text":"([^"]{5,500})"',
+                # 캡션/설명
+                r'"caption":"([^"]{5,500})"',
+                r'"description":\{"text":"([^"]{5,500})"',
                 # 추가 패턴
-                r'"story_attachment"[^}]*"description"[^}]*"text":"((?:[^"\\]|\\.)*)"}',
+                r'"story_attachment"[^}]*"description"[^}]*"text":"([^"]{5,500})"',
                 # og:description 메타 태그
                 r'<meta\s+property="og:description"\s+content="([^"]+)"',
                 r'<meta\s+content="([^"]+)"\s+property="og:description"',
+                # 이름 필드 (비디오 제목으로 사용될 수 있음 - 최후 수단)
+                r'"name":"([^"]{15,200})"',
             ]
             for pattern in content_patterns:
                 match = re.search(pattern, page_source)
@@ -1448,8 +1882,22 @@ class FacebookCrawler:
                         # Watch UI 텍스트 필터링
                         skip_texts = ['Watch', 'Log In', 'Sign Up', 'Facebook', 'See more']
                         if not any(content.strip().startswith(skip) for skip in skip_texts):
-                            logger.info(f"JSON에서 내용 추출: {content[:50]}...")
-                            return content[:500] if len(content) > 500 else content
+                            # JavaScript/코드 관련 텍스트 필터링
+                            code_patterns = [
+                                r'^[A-Z][a-z]+[A-Z]',  # CamelCase (e.g., WAWebOpus...)
+                                r'^__',                # Double underscore
+                                r'Bundle$',            # JavaScript bundle
+                                r'Worker$',            # Web Worker
+                                r'^function\s*\(',     # function declaration
+                                r'^\{.*\}$',           # JSON object
+                                r'^\[.*\]$',           # JSON array
+                            ]
+                            is_code = any(re.search(p, content.strip()) for p in code_patterns)
+                            if not is_code:
+                                logger.info(f"JSON에서 내용 추출: {content[:50]}...")
+                                return content[:500] if len(content) > 500 else content
+                            else:
+                                logger.debug(f"코드 패턴 필터링: {content[:30]}...")
         except Exception as e:
             logger.debug(f"JSON 내용 추출 실패: {e}")
 
@@ -1525,12 +1973,14 @@ class FacebookCrawler:
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
 
-            # 추가 대기 (동적 콘텐츠 로드)
-            time.sleep(2)
+            # 추가 대기 (동적 콘텐츠 로드) - Watch 동영상용 충분한 대기
+            time.sleep(5)
 
-            # 스크롤해서 콘텐츠 로드 유도
-            self.driver.execute_script("window.scrollTo(0, 300)")
-            time.sleep(2)
+            # 스크롤해서 콘텐츠 로드 유도 (여러 번 스크롤)
+            for scroll_y in [300, 600, 900]:
+                self.driver.execute_script(f"window.scrollTo(0, {scroll_y})")
+                time.sleep(1)
+            time.sleep(3)
 
             # 로그인 필요 여부 확인
             current_url = self.driver.current_url
@@ -1539,8 +1989,32 @@ class FacebookCrawler:
                 result["error"] = "login_required"
                 return result
 
-            # === Watch 동영상 전용: 다양한 방식으로 제목과 작성자 추출 ===
+            # === 작성자 및 제목 추출 ===
             page_source = self.driver.page_source
+
+            # 방법 최우선: URL에서 페이지명/사용자명 추출
+            # facebook.com/USERNAME/posts|videos|photos/... 패턴이 있으면 가장 정확
+            try:
+                # 원본 URL과 현재 URL 모두 확인
+                for check_url in [url, self.driver.current_url]:
+                    url_author_match = re.search(
+                        r'facebook\.com/([^/?]+)/(posts|videos|photos)',
+                        check_url
+                    )
+                    if url_author_match:
+                        url_slug = url_author_match.group(1)
+                        excluded_slugs = [
+                            'profile.php', 'watch', 'groups', 'events', 'marketplace',
+                            'gaming', 'photo.php', 'video.php', 'story.php',
+                            'permalink.php', 'share', 'reel', 'login', 'checkpoint',
+                            'home.php', 'mome', 'www.facebook.com', 'facebook.com',
+                        ]
+                        if url_slug not in excluded_slugs and not url_slug.isdigit() and len(url_slug) > 1:
+                            result["author"] = url_slug
+                            logger.info(f"URL에서 작성자 우선 설정: {url_slug}")
+                            break
+            except Exception:
+                pass
 
             # 방법 0: og:title 메타 태그에서 직접 추출 (가장 신뢰성 높음)
             try:
@@ -1562,14 +2036,15 @@ class FacebookCrawler:
                                     result["title"] = parts[0][:200]
                                     result["content"] = parts[0]
                                     logger.info(f"og:title에서 제목 추출: {result['title'][:50]}...")
-                            # 작성자: Facebook 직전 파트
-                            for i in range(len(parts) - 1, -1, -1):
-                                part = parts[i].strip()
-                                if part.lower() not in ['facebook', 'watch', ''] and len(part) > 1:
-                                    if self._is_valid_author_name(part):
-                                        result["author"] = part
-                                        logger.info(f"og:title에서 작성자 추출: {part}")
-                                        break
+                            # 작성자: Facebook 직전 파트 (URL 기반 작성자가 없을 때만)
+                            if not result["author"]:
+                                for i in range(len(parts) - 1, -1, -1):
+                                    part = parts[i].strip()
+                                    if part.lower() not in ['facebook', 'watch', ''] and len(part) > 1:
+                                        if self._is_valid_author_name(part):
+                                            result["author"] = part
+                                            logger.info(f"og:title에서 작성자 추출: {part}")
+                                            break
                             break
             except Exception as e:
                 logger.debug(f"og:title 추출 실패: {e}")
@@ -1577,6 +2052,13 @@ class FacebookCrawler:
             # 방법 0.5: JSON에서 video_owner 추출 (매우 정확)
             if not result["author"]:
                 try:
+                    # 로그인 사용자 필터링용
+                    logged_in_user = None
+                    viewer_match = re.search(r'"viewer"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', page_source)
+                    if viewer_match:
+                        logged_in_user = decode_unicode_escapes(viewer_match.group(1))
+                        logger.debug(f"Watch 로그인 사용자 감지: {logged_in_user}")
+
                     video_owner_patterns = [
                         r'"video"[^}]*"owner"[^}]*"name"\s*:\s*"([^"]+)"',
                         r'"video_owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
@@ -1584,15 +2066,28 @@ class FacebookCrawler:
                         r'"owning_page"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
                         r'"page"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
                         r'"channelName"\s*:\s*"([^"]+)"',
+                        # 단순 owner.name 패턴 (Watch 영상용)
+                        r'"owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
                     ]
                     for pattern in video_owner_patterns:
-                        match = re.search(pattern, page_source)
-                        if match:
-                            owner = decode_unicode_escapes(match.group(1))
+                        matches = re.findall(pattern, page_source)
+                        if matches:
+                            logger.debug(f"Watch 패턴 매칭: {pattern[:50]}... -> {len(matches)}개")
+                        for match in matches[:10]:  # 최대 10개만 확인
+                            owner = decode_unicode_escapes(match)
+                            logger.debug(f"Watch owner 후보: '{owner}'")
+                            # 로그인 사용자 제외
+                            if logged_in_user and owner == logged_in_user:
+                                logger.debug(f"Watch 로그인 사용자 제외: {owner}")
+                                continue
                             if owner and self._is_valid_author_name(owner):
                                 result["author"] = owner
                                 logger.info(f"JSON video_owner에서 작성자 추출: {owner}")
                                 break
+                            else:
+                                logger.debug(f"Watch owner 유효하지 않음: '{owner}'")
+                        if result["author"]:
+                            break
                 except Exception as e:
                     logger.debug(f"JSON video_owner 추출 실패: {e}")
 
@@ -1600,22 +2095,43 @@ class FacebookCrawler:
             if not result["author"] or not result["title"]:
                 try:
                     doc_title = self.driver.execute_script("return document.title;")
-                    if doc_title and '|' in doc_title:
-                        parts = [p.strip() for p in doc_title.split('|')]
-                        # 제목: 첫 번째 파트
-                        if not result["title"] and parts and parts[0] and len(parts[0]) > 3:
-                            if not self._is_date_time_text(parts[0]):
-                                result["title"] = parts[0][:200]
-                                result["content"] = parts[0]
-                                logger.info(f"document.title에서 제목 추출: {result['title'][:50]}...")
-                        # 작성자: Facebook 앞의 파트
-                        if not result["author"] and len(parts) >= 2:
-                            for i in range(len(parts) - 1, -1, -1):
-                                if parts[i].lower() != 'facebook' and parts[i].lower() != 'watch' and len(parts[i]) > 1:
-                                    if self._is_valid_author_name(parts[i]):
-                                        result["author"] = parts[i]
-                                        logger.info(f"document.title에서 작성자 추출: {parts[i]}")
-                                        break
+                    if doc_title:
+                        # 패턴 1: "|" 구분자 (Watch 영상: "제목 | 페이지명 | Facebook")
+                        if '|' in doc_title:
+                            parts = [p.strip() for p in doc_title.split('|')]
+                            # 제목: 첫 번째 파트
+                            if not result["title"] and parts and parts[0] and len(parts[0]) > 3:
+                                if not self._is_date_time_text(parts[0]):
+                                    result["title"] = parts[0][:200]
+                                    result["content"] = parts[0]
+                                    logger.info(f"document.title에서 제목 추출: {result['title'][:50]}...")
+                            # 작성자: Facebook 앞의 파트
+                            if not result["author"] and len(parts) >= 2:
+                                for i in range(len(parts) - 1, -1, -1):
+                                    if parts[i].lower() != 'facebook' and parts[i].lower() != 'watch' and len(parts[i]) > 1:
+                                        if self._is_valid_author_name(parts[i]):
+                                            result["author"] = parts[i]
+                                            logger.info(f"document.title에서 작성자 추출 (|): {parts[i]}")
+                                            break
+
+                        # 패턴 2: " - " 구분자 (일반 포스트: "(20+) 내용 - 작성자명")
+                        if not result["author"] and ' - ' in doc_title:
+                            parts = doc_title.rsplit(' - ', 1)  # 마지막 " - "로 분리
+                            if len(parts) == 2:
+                                author_part = parts[1].strip()
+                                # "| Facebook" 제거
+                                if '|' in author_part:
+                                    author_part = author_part.split('|')[0].strip()
+                                if author_part and author_part.lower() != 'facebook' and self._is_valid_author_name(author_part):
+                                    result["author"] = author_part
+                                    logger.info(f"document.title에서 작성자 추출 (-): {author_part}")
+                                # 제목도 추출
+                                if not result["title"] and parts[0]:
+                                    # (20+) 제거
+                                    title_part = re.sub(r'^\(\d+\+?\)\s*', '', parts[0]).strip()
+                                    if title_part and len(title_part) > 3:
+                                        result["title"] = title_part[:200]
+                                        result["content"] = title_part
                 except Exception as e:
                     logger.debug(f"document.title 추출 실패: {e}")
 
@@ -1624,27 +2140,41 @@ class FacebookCrawler:
                 try:
                     # Watch 페이지의 채널/페이지 이름 링크
                     author_js = self.driver.execute_script("""
-                        // 방법 A: aria-label이 있는 링크에서 추출
-                        var links = document.querySelectorAll('a[role="link"]');
-                        for (var link of links) {
-                            var href = link.getAttribute('href') || '';
-                            if (href.includes('/watch/') || href.includes('/page/') || href.includes('/profile')) {
+                        var skipTexts = ['home','홈','mome','watch','워치','reels','릴스','marketplace',
+                            '마켓플레이스','groups','그룹','gaming','게임','menu','메뉴','notifications',
+                            '알림','messenger','메신저','video','동영상','facebook','search','검색',
+                            'explore','둘러보기','saved','저장됨','events','이벤트','pages','페이지',
+                            'friends','친구','live','라이브','more','더보기','create','만들기'];
+                        function isValidAuthor(text) {
+                            if (!text || text.length < 2 || text.length > 50) return false;
+                            if (/^[0-9\\s\\.:]+$/.test(text)) return false;
+                            if (skipTexts.indexOf(text.toLowerCase()) >= 0) return false;
+                            if (/^[0-9년월일시분\\s]+$/.test(text)) return false;
+                            return true;
+                        }
+                        // 방법 A: 게시물 article 내 프로필 링크에서 추출
+                        var articles = document.querySelectorAll('div[role="article"], div[data-pagelet]');
+                        for (var article of articles) {
+                            var links = article.querySelectorAll('a[role="link"] strong, h2 a, h3 a');
+                            for (var link of links) {
                                 var text = link.innerText.trim();
-                                if (text && text.length > 1 && text.length < 50 && !text.match(/^[0-9\\s\\.:]+$/)) {
-                                    return text;
-                                }
+                                if (isValidAuthor(text)) return text;
                             }
                         }
-                        // 방법 B: 동영상 아래 페이지 이름
-                        var spans = document.querySelectorAll('span[dir="auto"]');
-                        for (var span of spans) {
-                            var parent = span.closest('a');
-                            if (parent && parent.href && (parent.href.includes('/watch/') || parent.href.includes('/'))) {
+                        // 방법 B: 프로필 링크 (페이지명 포함 URL)
+                        var profileLinks = document.querySelectorAll('a[href*="/posts/"], a[href*="/videos/"], a[href*="/photos/"]');
+                        for (var plink of profileLinks) {
+                            var span = plink.querySelector('span');
+                            if (span) {
                                 var text = span.innerText.trim();
-                                if (text && text.length > 1 && text.length < 50 && !text.match(/^[0-9\\s\\.:년월일시분]+$/)) {
-                                    return text;
-                                }
+                                if (isValidAuthor(text)) return text;
                             }
+                        }
+                        // 방법 C: h2/strong 내 링크 (넓은 범위, 단 네비게이션 제외)
+                        var headings = document.querySelectorAll('h2 a span, strong a span');
+                        for (var h of headings) {
+                            var text = h.innerText.trim();
+                            if (isValidAuthor(text)) return text;
                         }
                         return null;
                     """)
@@ -1654,20 +2184,205 @@ class FacebookCrawler:
                 except Exception as e:
                     logger.debug(f"DOM 작성자 추출 실패: {e}")
 
-            # og:title에서 추출 실패시 기존 방식 시도
+            # 방법 3: Selenium으로 데스크톱 페이지 직접 방문하여 작성자 추출 (쿠키 유지)
             if not result["author"]:
-                author_raw = self._extract_author(self.driver)
-                result["author"] = decode_unicode_escapes(author_raw) if author_raw else None
+                try:
+                    mobile_url = self.driver.current_url
+                    desktop_url = mobile_url.replace("m.facebook.com", "www.facebook.com")
+                    if "m.facebook.com" in mobile_url:
+                        logger.info(f"데스크톱 URL로 전환하여 작성자 추출: {desktop_url}")
+                        self.driver.get(desktop_url)
+                        time.sleep(5)
+
+                        # 로그인 리다이렉트 확인
+                        if "login" not in self.driver.current_url.lower():
+                            desktop_source = self.driver.page_source
+                            desktop_title = self.driver.execute_script("return document.title;") or ""
+                            desktop_title = re.sub(r'^\(\d+\+?\)\s*', '', desktop_title)
+
+                            # 3-A: document.title "콘텐츠 | 작성자명 | Facebook"
+                            if '|' in desktop_title:
+                                parts = [p.strip() for p in desktop_title.split('|')]
+                                for i in range(len(parts) - 1, -1, -1):
+                                    if parts[i].lower() not in ['facebook', 'watch', ''] and len(parts[i]) > 1:
+                                        if self._is_valid_author_name(parts[i]):
+                                            result["author"] = parts[i]
+                                            logger.info(f"데스크톱 title에서 작성자 추출: {parts[i]}")
+                                            break
+
+                            # 3-B: document.title "콘텐츠 - 작성자명"
+                            if not result["author"] and ' - ' in desktop_title:
+                                parts = desktop_title.rsplit(' - ', 1)
+                                if len(parts) == 2:
+                                    author_part = parts[1].strip()
+                                    if '|' in author_part:
+                                        author_part = author_part.split('|')[0].strip()
+                                    if author_part and author_part.lower() != 'facebook' and self._is_valid_author_name(author_part):
+                                        result["author"] = author_part
+                                        logger.info(f"데스크톱 title(-) 작성자: {author_part}")
+
+                            # 3-C: JSON owner.name (데스크톱에서 풍부한 JSON 제공)
+                            if not result["author"]:
+                                # 로그인 사용자 필터링
+                                logged_in = None
+                                viewer_m = re.search(r'"viewer"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', desktop_source)
+                                if viewer_m:
+                                    logged_in = decode_unicode_escapes(viewer_m.group(1))
+
+                                owner_patterns = [
+                                    r'"owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                                    r'"video_owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                                    r'"owning_page"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                                    r'"page"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                                    r'"channelName"\s*:\s*"([^"]+)"',
+                                    r'"publisher"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                                    r'"actor"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                                ]
+                                for pattern in owner_patterns:
+                                    match = re.search(pattern, desktop_source)
+                                    if match:
+                                        name = decode_unicode_escapes(match.group(1))
+                                        if name and self._is_valid_author_name(name):
+                                            if logged_in and name == logged_in:
+                                                continue
+                                            result["author"] = name
+                                            logger.info(f"데스크톱 JSON에서 작성자 추출: {name}")
+                                            break
+
+                            # 3-D: DOM 기반 추출 (데스크톱)
+                            if not result["author"]:
+                                desktop_author = self.driver.execute_script("""
+                                    var skipTexts = ['home','홈','mome','watch','워치','reels','릴스',
+                                        'marketplace','마켓플레이스','groups','그룹','gaming','게임',
+                                        'menu','메뉴','notifications','알림','messenger','메신저',
+                                        'video','동영상','facebook','search','검색','explore',
+                                        '둘러보기','saved','저장됨','events','이벤트','pages','페이지',
+                                        'friends','친구','live','라이브','more','더보기','create','만들기'];
+                                    function isValid(t) {
+                                        if (!t || t.length < 2 || t.length > 50) return false;
+                                        if (/^[0-9\\s\\.:]+$/.test(t)) return false;
+                                        if (skipTexts.indexOf(t.toLowerCase()) >= 0) return false;
+                                        return true;
+                                    }
+                                    // article 내 h2/strong/a 링크
+                                    var articles = document.querySelectorAll('div[role="article"], div[data-pagelet]');
+                                    for (var a of articles) {
+                                        var els = a.querySelectorAll('h2 a span, strong a, a[role="link"] strong');
+                                        for (var e of els) {
+                                            var t = e.innerText.trim();
+                                            if (isValid(t)) return t;
+                                        }
+                                    }
+                                    // 최상위 h2 > a
+                                    var h2s = document.querySelectorAll('h2 a');
+                                    for (var h of h2s) {
+                                        var t = h.innerText.trim();
+                                        if (isValid(t)) return t;
+                                    }
+                                    return null;
+                                """)
+                                if desktop_author and self._is_valid_author_name(desktop_author):
+                                    result["author"] = desktop_author
+                                    logger.info(f"데스크톱 DOM에서 작성자 추출: {desktop_author}")
+
+                            # 3-E: og:title 메타 태그
+                            if not result["author"]:
+                                og_m = re.search(r'property="og:title"\s+content="([^"]+)"', desktop_source)
+                                if not og_m:
+                                    og_m = re.search(r'content="([^"]+)"\s+property="og:title"', desktop_source)
+                                if og_m:
+                                    og_text = decode_unicode_escapes(og_m.group(1))
+                                    if '|' in og_text:
+                                        parts = [p.strip() for p in og_text.split('|')]
+                                        for i in range(len(parts) - 1, -1, -1):
+                                            if parts[i].lower() not in ['facebook', 'watch', ''] and len(parts[i]) > 1:
+                                                if self._is_valid_author_name(parts[i]):
+                                                    result["author"] = parts[i]
+                                                    logger.info(f"데스크톱 og:title 작성자: {parts[i]}")
+                                                    break
+
+                        else:
+                            logger.debug("데스크톱에서 로그인 리다이렉트 감지, 스킵")
+
+                        # 원래 모바일 URL로 복귀하지 않음 (이후 추출에 영향 없음)
+                except Exception as e:
+                    logger.debug(f"데스크톱 Selenium 작성자 추출 실패: {e}")
+
+            # 방법 4: URL에서 페이지명 추출 (최종 fallback)
+            if not result["author"]:
+                try:
+                    cur_url = self.driver.current_url
+                    # 패턴 1: facebook.com/pagename/posts|videos|photos|watch/...
+                    url_match = re.search(r'facebook\.com/([^/?]+)/(posts|videos|photos|watch|reels?)', cur_url)
+                    if not url_match:
+                        # 패턴 2: facebook.com/pagename (단순 페이지 URL)
+                        url_match = re.search(r'facebook\.com/([^/?]+)/?$', cur_url)
+                    if url_match:
+                        url_page = url_match.group(1)
+                        excluded = ['profile.php', 'watch', 'groups', 'events', 'marketplace',
+                                   'gaming', 'photo.php', 'video.php', 'story.php', 'permalink.php',
+                                   'share', 'reel', 'login', 'checkpoint', 'home.php', 'mome']
+                        if url_page not in excluded and not url_page.isdigit():
+                            result["author"] = url_page
+                            logger.info(f"URL에서 작성자 설정: {url_page}")
+                except Exception:
+                    pass
 
             if not result["content"]:
-                content_raw = self._extract_content(self.driver)
-                result["content"] = decode_unicode_escapes(content_raw) if content_raw else None
+                # Watch 동영상 DOM에서 직접 설명 추출
+                try:
+                    content_js = self.driver.execute_script("""
+                        // Watch 동영상 설명 추출
+                        var selectors = [
+                            'div[data-ad-comet-preview="message"]',
+                            'div[data-ad-preview="message"]',
+                            'span[dir="auto"][class*="x193iq5w"]',
+                            'div[dir="auto"] span'
+                        ];
+                        for (var sel of selectors) {
+                            var elems = document.querySelectorAll(sel);
+                            for (var elem of elems) {
+                                var text = elem.innerText.trim();
+                                if (text && text.length > 20 && text.length < 1000) {
+                                    if (!text.match(/^[0-9\\s\\.:년월일시분좋아요댓글공유]+$/)) {
+                                        return text;
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    """)
+                    if content_js:
+                        result["content"] = content_js[:500]
+                        logger.info(f"DOM JS에서 content 추출: {content_js[:50]}...")
+                except Exception as e:
+                    logger.debug(f"DOM content 추출 실패: {e}")
+
+                if not result["content"]:
+                    content_raw = self._extract_content(self.driver)
+                    result["content"] = decode_unicode_escapes(content_raw) if content_raw else None
                 # title은 content의 첫 줄에서 추출
                 if result["content"] and not result["title"]:
                     first_line = result["content"].split('\n')[0].strip()
                     # 날짜/시간 패턴이면 제외
                     if not self._is_date_time_text(first_line) and len(first_line) > 3:
                         result["title"] = first_line[:100] if len(first_line) > 100 else first_line
+
+            # Facebook 알림 배지 접두사 제거: "(20+) 실제내용" → "실제내용"
+            for field in ["title", "content"]:
+                if result.get(field) and re.match(r'^\(\d+\+?\)\s+', result[field]):
+                    cleaned = re.sub(r'^\(\d+\+?\)\s+', '', result[field])
+                    if cleaned:
+                        logger.debug(f"알림 배지 접두사 제거 ({field}): {result[field][:30]} → {cleaned[:30]}")
+                        result[field] = cleaned
+
+            # HTML 엔티티 디코딩 (작성자/제목/콘텐츠)
+            for field in ["author", "title", "content"]:
+                if result.get(field):
+                    result[field] = html_module.unescape(result[field])
+                    # 미해석 HTML 엔티티 정리 (&Ai; -> &Ai)
+                    # html.unescape 후 남은 &Word; 패턴은 유효하지 않은 엔티티
+                    result[field] = re.sub(r'&([A-Za-z]{1,8});', r'&\1', result[field])
 
             # 최종 검증: title이 날짜/시간이면 제거
             if result.get("title") and self._is_date_time_text(result["title"]):
@@ -1682,71 +2397,196 @@ class FacebookCrawler:
             if result.get("content") and re.match(fb_generic_title_pattern, result["content"], re.IGNORECASE):
                 logger.debug(f"Facebook 일반 내용 필터링: {result['content']}")
                 result["content"] = None
+                # 필터링 후 실제 내용 다시 추출 시도
+                content_raw = self._extract_content(self.driver)
+                if content_raw:
+                    result["content"] = decode_unicode_escapes(content_raw)
+                    logger.info(f"필터링 후 재추출 성공: {result['content'][:50]}...")
 
-            # === 썸네일 추출 (동영상/게시물 이미지만, 메신저 제외) ===
-            page_source = self.driver.page_source
-
-            # 동영상 전용 썸네일 패턴 (우선순위 높음)
-            video_thumbnail_patterns = [
-                r'"video_preview_image":\{"uri":"([^"]+)"',
-                r'"preferred_thumbnail":\{"image":\{"uri":"([^"]+)"',
-                r'"thumbnailImage":\{"uri":"([^"]+)"',
-                r'"playable_url_quality_hd".*?"thumbnail":\{"uri":"([^"]+)"',
-                r'"video"[^}]*"thumbnailImage"[^}]*"uri":"([^"]+)"',
+            # 브라우저 알림/권한 팝업 텍스트 필터링 (Chrome 데스크톱 알림 등)
+            browser_noise_patterns = [
+                r'설정을\s*변경하려면\s*설정\s*슬라이더',
+                r'Chrome에\s*데스크톱\s*알림',
+                r'알림을\s*보낼\s*수\s*있는\s*권한',
+                r'Turn on desktop notifications',
+                r'Allow notifications',
             ]
-
-            for pattern in video_thumbnail_patterns:
-                match = re.search(pattern, page_source)
-                if match:
-                    thumbnail = match.group(1)
-                    thumbnail = thumbnail.replace('\\/', '/').replace('&amp;', '&')
-                    # 메신저/채팅 관련 URL 제외
-                    if 'messenger' not in thumbnail.lower() and 'chat' not in thumbnail.lower():
-                        result["thumbnail"] = thumbnail
-                        logger.info(f"동영상 썸네일 추출 성공: {thumbnail[:50]}...")
-                        break
-
-            # 동영상 썸네일 없으면 일반 이미지 시도
-            if not result.get("thumbnail"):
-                general_patterns = [
-                    r'<meta\s+property="og:image"\s+content="([^"]+)"',
-                    r'<meta\s+content="([^"]+)"\s+property="og:image"',
-                ]
-                for pattern in general_patterns:
-                    match = re.search(pattern, page_source)
-                    if match:
-                        thumbnail = match.group(1)
-                        thumbnail = thumbnail.replace('\\/', '/').replace('&amp;', '&')
-                        # 메신저/채팅/프로필 관련 URL 제외
-                        if ('messenger' not in thumbnail.lower() and
-                            'chat' not in thumbnail.lower() and
-                            '/p50x50/' not in thumbnail and  # 작은 프로필 이미지 제외
-                            'profile' not in thumbnail.lower()):
-                            result["thumbnail"] = thumbnail
-                            logger.info(f"og:image 썸네일 추출 성공: {thumbnail[:50]}...")
+            for field in ["content", "title"]:
+                if result.get(field):
+                    for noise_pattern in browser_noise_patterns:
+                        if re.search(noise_pattern, result[field], re.IGNORECASE):
+                            logger.debug(f"브라우저 알림 텍스트 필터링: {result[field][:50]}...")
+                            result[field] = None
                             break
 
-            # === JSON 패턴으로 engagement 데이터 추출 ===
+            # 필터링 후 content가 없으면 재추출
+            if not result.get("content"):
+                content_raw = self._extract_content(self.driver)
+                if content_raw:
+                    clean = decode_unicode_escapes(content_raw)
+                    # 재추출된 내용도 브라우저 노이즈인지 체크
+                    is_noise = False
+                    for noise_pattern in browser_noise_patterns:
+                        if re.search(noise_pattern, clean, re.IGNORECASE):
+                            is_noise = True
+                            break
+                    if not is_noise:
+                        result["content"] = clean
+                        logger.info(f"필터링 후 재추출 성공: {clean[:50]}...")
+
+            # 페이스북 썸네일 비활성화 (로그인 상태에서 정확한 게시물 이미지 추출 불가)
+            result["thumbnail"] = None
+
+            # === JSON 패턴으로 engagement 데이터 추출 (스코핑 적용) ===
             self._try_javascript_extraction(result)
 
-            # === 댓글 내용 추출 시도 (강화 버전) ===
-            if result["comments"] > 0 or True:  # 항상 시도
+            # 좋아요: JSON 스코핑이 다른 게시물 데이터를 포함할 수 있으므로 DOM 교차 검증
+            json_likes = result["likes"]
+            dom_likes = self._extract_reactions(self.driver)
+            if json_likes == 0:
+                result["likes"] = dom_likes
+            elif dom_likes > 0 and json_likes != dom_likes:
+                # JSON과 DOM이 크게 다르면 (3배 이상 차이) DOM 우선
+                ratio = max(json_likes, dom_likes) / max(min(json_likes, dom_likes), 1)
+                if ratio >= 3:
+                    logger.warning(
+                        f"좋아요 교차검증: JSON({json_likes}) vs DOM({dom_likes}), "
+                        f"비율 {ratio:.1f}x → DOM 값 사용"
+                    )
+                    result["likes"] = dom_likes
+
+            # 작성자 기반 전체 소스 검증: 스코핑+DOM 모두 실패 시 안전망
+            # 전체 page_source에서 작성자 근처의 reaction 데이터를 찾아 비교
+            author_slug_for_verify = None
+            full_source = None
+            try:
+                url_match = re.search(r'facebook\.com/([^/?]+)/(posts|videos|photos)', url)
+                if url_match:
+                    author_slug_for_verify = url_match.group(1)
+                if author_slug_for_verify and result["likes"] < 500:
+                    full_source = self.driver.page_source
+                    # 작성자 슬러그의 모든 출현 위치에서 가장 가까운 reaction count 탐색
+                    search_start_v = 0
+                    best_author_likes = 0
+                    while True:
+                        slug_pos = full_source.find(author_slug_for_verify, search_start_v)
+                        if slug_pos < 0:
+                            break
+                        # 작성자 위치 ±8000자 범위에서 reaction count 검색
+                        v_start = max(0, slug_pos - 8000)
+                        v_end = min(len(full_source), slug_pos + 8000)
+                        v_window = full_source[v_start:v_end]
+                        verify_patterns = [
+                            r'"reaction_count":\{"count":(\d+)',
+                            r'"i18n_reaction_count":"([\d,\.KMkm천만억]+)"',
+                            r'"feedback_reaction_count":(\d+)',
+                            r'"video_reaction_count":(\d+)',
+                        ]
+                        for vp in verify_patterns:
+                            for vm in re.finditer(vp, v_window):
+                                vc = self._parse_count(vm.group(1))
+                                if vc > best_author_likes:
+                                    best_author_likes = vc
+                        search_start_v = slug_pos + 1
+                        if search_start_v > len(full_source) - 10:
+                            break
+                    if best_author_likes > result["likes"] * 3:
+                        logger.warning(
+                            f"작성자 기반 검증: 스코핑({result['likes']}) vs "
+                            f"작성자 근처({best_author_likes}), "
+                            f"비율 {best_author_likes/max(result['likes'],1):.1f}x → 작성자 근처 값 사용"
+                        )
+                        result["likes"] = best_author_likes
+            except Exception as e:
+                logger.debug(f"작성자 기반 검증 실패: {e}")
+
+            # 댓글: JSON 스코핑이 다른 게시물 데이터를 포함할 수 있으므로 항상 DOM 교차 검증
+            json_comments = result["comments"]
+            dom_comments = self._extract_comments_count(self.driver)
+            if json_comments == 0:
+                result["comments"] = dom_comments
+            elif dom_comments > 0 and json_comments > dom_comments * 5:
+                logger.warning(
+                    f"댓글 교차검증: JSON({json_comments}) vs DOM({dom_comments}), "
+                    f"비율 {json_comments/dom_comments:.0f}x → DOM 값 사용"
+                )
+                result["comments"] = dom_comments
+            elif dom_comments == 0 and json_comments > 0:
+                # DOM이 0인데 JSON에 값이 있는 경우: 좋아요 대비 비율로 오염 검증
+                likes = result.get("likes", 0)
+                if likes > 0 and json_comments > likes * 5:
+                    logger.warning(
+                        f"댓글 오염 의심 (DOM=0): JSON({json_comments}) vs likes({likes}), "
+                        f"비율 {json_comments/likes:.0f}x → 0으로 대체"
+                    )
+                    result["comments"] = 0
+
+            # 댓글도 작성자 기반 전체 소스 검증
+            try:
+                if author_slug_for_verify and result["comments"] <= 1:
+                    if not full_source:
+                        full_source = self.driver.page_source
+                    search_start_vc = 0
+                    best_author_comments = 0
+                    while True:
+                        slug_pos = full_source.find(author_slug_for_verify, search_start_vc)
+                        if slug_pos < 0:
+                            break
+                        v_start = max(0, slug_pos - 8000)
+                        v_end = min(len(full_source), slug_pos + 8000)
+                        v_window = full_source[v_start:v_end]
+                        comment_verify_patterns = [
+                            r'"comment_count":\{"total_count":(\d+)',
+                            r'"comment_count":(\d+)',
+                            r'"feedback_comment_count":(\d+)',
+                        ]
+                        for vp in comment_verify_patterns:
+                            for vm in re.finditer(vp, v_window):
+                                vc = int(vm.group(1))
+                                if 0 < vc < 100000 and vc > best_author_comments:
+                                    best_author_comments = vc
+                        search_start_vc = slug_pos + 1
+                        if search_start_vc > len(full_source) - 10:
+                            break
+                    if best_author_comments > max(result["comments"], 1) * 3:
+                        logger.warning(
+                            f"댓글 작성자 기반 검증: 기존({result['comments']}) vs "
+                            f"작성자 근처({best_author_comments}) → 작성자 근처 값 사용"
+                        )
+                        result["comments"] = best_author_comments
+            except Exception as e:
+                logger.debug(f"댓글 작성자 기반 검증 실패: {e}")
+
+            if result["shares"] == 0:
+                result["shares"] = self._extract_shares_count(self.driver)
+            if result["views"] is None:
+                result["views"] = self._extract_views_count(self.driver)
+
+            # === 댓글 내용 추출 시도 (강화 버전 v2) ===
+            if self.collect_comments and (result["comments"] > 0 or True):  # collect_comments=False이면 스킵
                 try:
                     comments_list = []
 
-                    # === 1단계: "댓글 보기" 버튼 클릭하여 댓글 펼치기 ===
+                    # === 1단계: 댓글 영역 클릭하여 댓글 로드 ===
                     logger.info("Facebook 댓글 로딩을 위해 버튼 클릭 시도...")
+
+                    # 2026 Facebook UI: 댓글 수 표시 영역 클릭
                     comment_button_selectors = [
-                        # 2024-2026 Facebook 댓글 버튼
-                        "//div[@aria-label='댓글' or @aria-label='Comment' or @aria-label='留言']",
-                        "//span[contains(text(), '댓글') and not(contains(text(), '없'))]",
-                        "//span[contains(text(), 'comment') or contains(text(), 'Comment')]",
-                        "//div[@role='button'][contains(., '댓글')]",
-                        "//a[contains(@href, 'comment')]",
-                        # "모두 보기" 버튼
-                        "//span[contains(text(), '모두 보기')]",
-                        "//span[contains(text(), 'View more') or contains(text(), 'See all')]",
-                        "//div[contains(@class, 'comment')]//span[contains(text(), '더')]",
+                        # 댓글 수가 표시된 영역 (가장 확실)
+                        "//span[contains(text(), '댓글') and contains(text(), '개')]",
+                        "//span[contains(text(), 'comment') and not(contains(text(), 'Write'))]",
+                        # 댓글 아이콘/버튼
+                        "//div[@aria-label='댓글 달기' or @aria-label='Leave a comment' or @aria-label='Write a comment']",
+                        "//div[@aria-label='댓글' or @aria-label='Comment' or @aria-label='Comments']",
+                        # 숫자 + 댓글 텍스트
+                        "//span[matches(text(), '\\d+.*댓글')]",
+                        "//span[contains(text(), '개의 댓글')]",
+                        # 일반 댓글 버튼
+                        "//span[text()='댓글' or text()='Comment' or text()='Comments']",
+                        "//div[@role='button']//span[contains(text(), '댓글')]",
+                        # 댓글 입력창 (클릭하면 댓글 섹션 열림)
+                        "//div[contains(@aria-label, '댓글을 입력') or contains(@aria-label, 'Write a comment')]",
+                        "//input[contains(@placeholder, '댓글') or contains(@placeholder, 'comment')]",
                     ]
 
                     clicked = 0
@@ -1758,54 +2598,118 @@ class FacebookCrawler:
                                     if btn.is_displayed() and btn.is_enabled():
                                         self.driver.execute_script("arguments[0].click();", btn)
                                         clicked += 1
-                                        time.sleep(1.5)
+                                        logger.info(f"댓글 버튼 클릭: {selector[:50]}")
+                                        time.sleep(2)
                                 except:
                                     pass
-                            if clicked >= 2:
+                            if clicked >= 1:
                                 break
                         except:
                             pass
 
                     if clicked > 0:
                         logger.info(f"댓글 버튼 {clicked}회 클릭")
-                        time.sleep(2)
+                        time.sleep(5)  # 댓글 로드 대기 시간 증가 (5초)
 
-                    # === 2단계: 댓글 영역으로 스크롤 및 추가 로딩 ===
+                    # === 2단계: 모달 내에서 댓글 영역으로 스크롤 및 추가 로딩 ===
                     try:
-                        # 페이지 하단으로 스크롤하여 댓글 로드
-                        for i in range(5):
-                            self.driver.execute_script("window.scrollBy(0, 500);")
-                            time.sleep(0.8)
+                        # 모달이 있으면 모달 내에서 스크롤
+                        modals = self.driver.find_elements(By.XPATH, "//div[@role='dialog']")
+                        if modals:
+                            modal = modals[0]
+                            logger.info("모달 내에서 댓글 로드 중...")
 
-                        # "더 보기" 또는 "이전 댓글 보기" 클릭
+                            # 모달 맨 아래로 스크롤 (댓글 섹션 로드)
+                            for i in range(10):
+                                self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", modal)
+                                time.sleep(0.5)
+
+                            time.sleep(2)
+
+                            # "관련성 높은 댓글" → "모든 댓글" 전환 클릭
+                            relevance_btns = modal.find_elements(By.XPATH,
+                                ".//span[contains(text(), '관련성') or contains(text(), 'Most relevant')]")
+                            for btn in relevance_btns[:2]:
+                                try:
+                                    self.driver.execute_script("arguments[0].click();", btn)
+                                    logger.info("관련성 메뉴 클릭")
+                                    time.sleep(2)
+                                    # "모든 댓글" 선택
+                                    all_comments = self.driver.find_elements(By.XPATH,
+                                        "//span[contains(text(), '모든 댓글') or contains(text(), 'All comments')]")
+                                    for ac in all_comments[:1]:
+                                        self.driver.execute_script("arguments[0].click();", ac)
+                                        logger.info("모든 댓글 선택")
+                                        time.sleep(2)
+                                except:
+                                    pass
+
+                            # 추가 스크롤
+                            for i in range(5):
+                                self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", modal)
+                                time.sleep(0.5)
+                        else:
+                            # 모달 없으면 일반 스크롤
+                            for i in range(5):
+                                self.driver.execute_script("window.scrollBy(0, 400);")
+                                time.sleep(0.8)
+
+                        # "더 보기", "이전 댓글 보기", "모든 댓글 보기" 클릭
                         more_selectors = [
                             "//span[contains(text(), '이전 댓글')]",
-                            "//span[contains(text(), 'previous') or contains(text(), 'Previous')]",
-                            "//div[@role='button'][contains(., '더 보기') or contains(., 'more')]",
+                            "//span[contains(text(), '더 보기') or contains(text(), '모두 보기')]",
+                            "//span[contains(text(), 'View more') or contains(text(), 'previous')]",
+                            "//span[contains(text(), 'View all') or contains(text(), 'See all')]",
                         ]
                         for sel in more_selectors:
                             try:
                                 more_btns = self.driver.find_elements(By.XPATH, sel)
-                                for btn in more_btns[:2]:
-                                    if btn.is_displayed():
-                                        btn.click()
-                                        time.sleep(1)
+                                for btn in more_btns[:3]:
+                                    try:
+                                        if btn.is_displayed():
+                                            self.driver.execute_script("arguments[0].click();", btn)
+                                            logger.info(f"더보기 클릭: {sel[:40]}")
+                                            time.sleep(2)
+                                    except:
+                                        pass
                             except:
                                 pass
+
+                        # 댓글 로드 대기
+                        time.sleep(3)
                     except:
                         pass
 
-                    # 페이지 소스 새로 가져오기 (댓글 로드 후)
-                    page_source = self.driver.page_source
+                    # 페이지 소스 새로 가져오기 (댓글 로드 후) - 모달 우선
+                    # 모달이 있으면 모달의 HTML만 사용 (피드 게시물 제외)
+                    modals = self.driver.find_elements(By.XPATH, "//div[@role='dialog']")
+                    if modals:
+                        try:
+                            page_source = modals[0].get_attribute('outerHTML')
+                            logger.info("3단계: 모달 HTML만 사용 (피드 필터링)")
+                        except:
+                            page_source = self.driver.page_source
+                    else:
+                        page_source = self.driver.page_source
 
                     # === 3단계: 페이지 소스에서 댓글 JSON 추출 (작성자 포함) ===
-                    # 작성자와 텍스트를 함께 추출하는 패턴
+                    # 작성자와 텍스트를 함께 추출하는 패턴 (2024-2026 Facebook 구조)
                     comment_with_author_patterns = [
-                        # Facebook 2024-2026 댓글 구조: author와 body가 함께 있는 패턴
+                        # author.name + body.text 구조
                         r'"author":\{[^}]*"name":"((?:[^"\\]|\\.)*)"\}[^}]*"body":\{"text":"((?:[^"\\]|\\.)*)"\}',
                         r'"commenter":\{[^}]*"name":"((?:[^"\\]|\\.)*)"\}[^}]*"body":\{"text":"((?:[^"\\]|\\.)*)"\}',
                         # 역순 패턴
                         r'"body":\{"text":"((?:[^"\\]|\\.)*)"\}[^}]*"author":\{[^}]*"name":"((?:[^"\\]|\\.)*)"\}',
+                        # 2025-2026 새 패턴: message.text 구조
+                        r'"author":\{[^}]*"name":"((?:[^"\\]|\\.)*)"\}[^}]*"message":\{"text":"((?:[^"\\]|\\.)*)"\}',
+                        # display_name 패턴
+                        r'"display_name":"((?:[^"\\]|\\.)*)"\}[^}]*"body":\{"text":"((?:[^"\\]|\\.)*)"\}',
+                        # short_name 패턴
+                        r'"short_name":"((?:[^"\\]|\\.)*)"\}[^}]*"body":\{"text":"((?:[^"\\]|\\.)*)"\}',
+                        # username 패턴
+                        r'"username":"((?:[^"\\]|\\.)*)"\}[^}]*"body":\{"text":"((?:[^"\\]|\\.)*)"\}',
+                        # feedback 구조
+                        r'"feedback_commenter_name":"((?:[^"\\]|\\.)*)"\}[^}]*"text":"((?:[^"\\]|\\.)*)"\}',
                     ]
 
                     # 먼저 작성자+텍스트 함께 추출 시도
@@ -1823,7 +2727,12 @@ class FacebookCrawler:
                                 text = decode_unicode_escapes(text)
 
                                 if text and len(text) > 5 and not any(c.get('text') == text[:200] for c in comments_list):
-                                    if not any(skip in text.lower() for skip in ['좋아요', 'like', 'reply', '답글', '공유', 'share']):
+                                    # UI 요소 필터링 (강화)
+                                    skip_json = ['좋아요', 'like', 'reply', '답글', '공유', 'share',
+                                                '동영상에서', '둘러보기', '새로운 소식', '오리지널 오디오',
+                                                'reels', 'watch', 'videos from', 'original audio',
+                                                '팔로우', 'follow', '구독', 'subscribe', '홈', 'home']
+                                    if not any(skip in text.lower() for skip in skip_json):
                                         comments_list.append({
                                             "author": author if author else "user",
                                             "text": text[:200],
@@ -1837,115 +2746,466 @@ class FacebookCrawler:
                         comment_patterns = [
                             r'"body":\{"text":"((?:[^"\\]|\\.)*)"}',
                             r'"comment_body":\{"text":"((?:[^"\\]|\\.)*)"}',
+                            r'"message":\{"text":"((?:[^"\\]|\\.)*)"}',
                         ]
+
+                        # 작성자명 추출 패턴 (우선순위 순)
+                        author_name_patterns = [
+                            r'"name":"((?:[^"\\]|\\.){2,50})"',
+                            r'"display_name":"((?:[^"\\]|\\.){2,50})"',
+                            r'"short_name":"((?:[^"\\]|\\.){2,50})"',
+                            r'"username":"((?:[^"\\]|\\.){2,50})"',
+                        ]
+
+                        # 유효한 작성자명 검증 함수
+                        def is_valid_author_name(name):
+                            if not name or len(name) < 2 or len(name) > 50:
+                                return False
+                            # 제외할 키워드
+                            skip_keywords = [
+                                'facebook', 'video', 'comment', 'like', 'share',
+                                'reply', 'bundle', 'worker', 'module', 'script',
+                                'handler', 'listener', 'callback', 'undefined',
+                                'null', 'true', 'false', 'function', 'object',
+                            ]
+                            if any(skip in name.lower() for skip in skip_keywords):
+                                return False
+                            # 순수 숫자 제외
+                            if name.isdigit():
+                                return False
+                            # 특수문자만 있는 경우 제외
+                            if not any(c.isalnum() for c in name):
+                                return False
+                            return True
+
                         for pattern in comment_patterns:
                             matches = re.findall(pattern, page_source)
                             for match in matches[:15]:
                                 if match and len(match) > 5:
                                     text = decode_unicode_escapes(match)
                                     if text and len(text) > 5 and not any(c.get('text') == text[:200] for c in comments_list):
-                                        # UI 텍스트 필터링
-                                        if not any(skip in text.lower() for skip in ['좋아요', 'like', 'reply', '답글', '공유', 'share']):
+                                        # UI 텍스트 필터링 (강화)
+                                        skip_ui = ['좋아요', 'like', 'reply', '답글', '공유', 'share',
+                                                  '동영상에서', '둘러보기', '새로운 소식', '오리지널 오디오',
+                                                  'reels', 'watch', 'videos from', 'original audio']
+                                        if not any(skip in text.lower() for skip in skip_ui):
+                                            # 피드 게시물 필터링 (해시태그 3개 이상, URL 포함, 줄바꿈 2개 이상)
+                                            hashtag_count = text.count('#')
+                                            newline_count = text.count('\n')
+                                            has_url = 'http' in text.lower() or 'www.' in text.lower()
+                                            # 피드 게시물 특징: 해시태그 많음, URL 있음, 줄바꿈 많음
+                                            if hashtag_count >= 3 or has_url or newline_count >= 2:
+                                                continue  # 피드 게시물로 판단, 스킵
+
                                             # 텍스트 위치에서 작성자 찾기 시도
                                             text_pos = page_source.find(f'"{match}"')
-                                            author_name = "user"
+                                            author_name = None
+
                                             if text_pos > 0:
-                                                # 앞쪽 500자에서 author name 찾기
-                                                nearby = page_source[max(0, text_pos-500):text_pos]
-                                                author_match = re.search(r'"name":"((?:[^"\\]|\\.){1,50})"', nearby)
-                                                if author_match:
-                                                    potential_author = decode_unicode_escapes(author_match.group(1))
-                                                    # 유효한 작성자명인지 확인
-                                                    if potential_author and len(potential_author) > 1 and len(potential_author) < 50:
-                                                        if not any(skip in potential_author.lower() for skip in ['facebook', 'video', 'comment', 'like']):
-                                                            author_name = potential_author
+                                                # 앞쪽 1500자에서 author name 찾기 (범위 확대)
+                                                nearby = page_source[max(0, text_pos-1500):text_pos]
+
+                                                # 여러 패턴으로 작성자 찾기 시도
+                                                for author_pattern in author_name_patterns:
+                                                    # 가장 마지막(텍스트에 가까운) 매치를 사용
+                                                    author_matches = list(re.finditer(author_pattern, nearby))
+                                                    if author_matches:
+                                                        # 역순으로 검사 (텍스트에 가까운 것부터)
+                                                        for am in reversed(author_matches):
+                                                            potential_author = decode_unicode_escapes(am.group(1))
+                                                            if is_valid_author_name(potential_author):
+                                                                author_name = potential_author
+                                                                break
+                                                    if author_name:
+                                                        break
 
                                             comments_list.append({
-                                                "author": author_name,
+                                                "author": author_name if author_name else "user",
                                                 "text": text[:200],
                                                 "likes": 0
                                             })
                             if len(comments_list) >= 10:
                                 break
 
-                    # === 4단계: DOM에서 댓글 요소 추출 (fallback) ===
+                    # === 4단계: DOM에서 댓글 요소 추출 (2026 강화 버전 v3) ===
                     if len(comments_list) < 5:
-                        # 먼저 댓글 작성자 목록 추출 시도
-                        dom_author_names = []
+                        logger.info("DOM에서 직접 댓글 추출 시도...")
+
+                        # 2026 Facebook 댓글 구조:
+                        # [프로필이미지] [작성자이름(링크)] [댓글텍스트] [시간 좋아요 답글달기 번역보기]
+                        # 핵심: "답글 달기" 또는 "Reply" 버튼이 있는 요소가 댓글
+
+                        # 방법 0 (최우선): Facebook 2026 댓글 구조 기반 추출
+                        # 댓글 구조: [프로필이미지][작성자링크][댓글텍스트][시간/좋아요/답글달기]
+
+                        # 모달 또는 페이지에서 검색 컨텍스트 설정
+                        search_context = self.driver
                         try:
-                            author_selectors = [
-                                "//div[contains(@data-testid, 'comment')]//a[contains(@href, '/profile') or contains(@href, '/user')]//span",
-                                "//div[contains(@aria-label, 'omment')]//a//span[@dir='auto']",
-                            ]
-                            for sel in author_selectors:
-                                author_elems = self.driver.find_elements(By.XPATH, sel)
-                                for ae in author_elems[:20]:
-                                    try:
-                                        name = ae.text.strip()
-                                        if name and len(name) > 1 and len(name) < 50:
-                                            if not any(skip in name.lower() for skip in ['facebook', 'video', 'comment', 'like', '좋아요', '답글']):
-                                                dom_author_names.append(name)
-                                    except:
-                                        pass
+                            modals = self.driver.find_elements(By.XPATH, "//div[@role='dialog']")
+                            if modals:
+                                search_context = modals[0]
+                                logger.info(f"모달 내에서 댓글 검색 시작")
                         except:
                             pass
 
-                        dom_selectors = [
-                            # Facebook 2024-2026 댓글 구조
-                            "//div[contains(@data-testid, 'comment')]//span[string-length(text()) > 10]",
-                            "//div[@aria-label='댓글' or @aria-label='Comment']//div//span[string-length(text()) > 15]",
-                            "//ul//li//div//span[string-length(text()) > 15 and string-length(text()) < 300]",
-                            # 일반 텍스트 패턴
-                            "//div[contains(@class, 'comment')]//span[string-length(text()) > 10]",
+                        # 숫자/통계 패턴 필터 함수
+                        def is_stat_text(text):
+                            """좋아요 수, 공유 수 등 통계 텍스트인지 확인"""
+                            if not text:
+                                return True
+                            # 숫자+단위 패턴 (예: "2.6천", "54", "1.2만", "100K", "1.5M")
+                            if re.match(r'^[\d,.]+\s*(천|만|억|K|M|B)?$', text, re.IGNORECASE):
+                                return True
+                            # 순수 숫자
+                            if text.replace(',', '').replace('.', '').isdigit():
+                                return True
+                            return False
+
+                        # Facebook UI 메뉴 항목 필터 (확장)
+                        fb_ui_menu_items = [
+                            # 좌측 사이드바 메뉴
+                            '친구', '그룹', '마켓플레이스', '동영상', 'Watch', 'Marketplace',
+                            '이벤트', '추억', '저장됨', '과거의 오늘', '메시지', '알림',
+                            '홈', '피드', 'Reels', '게임', '페이지', '설정', '로그아웃',
+                            'Friends', 'Groups', 'Events', 'Memories', 'Saved', 'On This Day',
+                            '뉴스피드', '스토리', '더 보기', 'See More', '모두 보기',
+                            # 광고/제품 관련
+                            '광고 관리자', 'Meta Quest', 'Ad Manager', 'Business Suite',
+                            '비즈니스 도구', 'Meta Business', '최근 광고 활동', '광고 활동',
+                            # 메신저/앱 관련
+                            'Messenger', 'Instagram', 'WhatsApp', 'Threads',
+                            # 기타 UI 요소
+                            '생일', '날씨', '기금 모금', 'Fundraiser', '쇼핑', 'Shopping',
+                            '첫 번째 동영상', '모든 동영상', '앱센', 'Crisis Response',
+                            '메타 AI', 'Meta AI', '게시물', '사진', '활동 로그',
                         ]
 
-                        author_idx = 0
-                        for selector in dom_selectors:
+                        def is_fb_ui_menu(text):
+                            """Facebook UI 메뉴 항목인지 확인"""
+                            if not text:
+                                return True
+                            # 정확한 매치
+                            if text in fb_ui_menu_items:
+                                return True
+                            # 부분 매치 (Meta Quest 3S 같은 경우)
+                            for menu_item in fb_ui_menu_items:
+                                if menu_item in text:
+                                    return True
+                            return False
+
+                        # 방법 0-1: 답글 달기 버튼이 있는 댓글 아이템 찾기 (가장 정확)
+                        # Facebook 댓글은 반드시 "답글 달기" 또는 "Reply" 버튼을 포함
+                        comment_item_selectors = [
+                            # 답글 달기 버튼이 있는 li 아이템 (가장 정확)
+                            ".//ul//li[.//span[text()='답글 달기']]",
+                            ".//ul//li[.//span[text()='Reply']]",
+                            # div 기반 (답글 버튼 포함)
+                            ".//div[@role='article'][.//span[text()='답글 달기' or text()='Reply']]",
+                        ]
+
+                        for item_sel in comment_item_selectors:
                             if len(comments_list) >= 10:
                                 break
                             try:
-                                elements = self.driver.find_elements(By.XPATH, selector)
-                                for elem in elements[:15]:
-                                    try:
-                                        text = elem.text.strip()
-                                        if text and len(text) > 10 and len(text) < 300:
-                                            # UI 텍스트 필터링
-                                            if not any(skip in text.lower() for skip in ['좋아요', 'like', 'reply', '답글', '공유', 'share', '시간', 'hour', 'day', '분', 'min']):
+                                comment_items = search_context.find_elements(By.XPATH, item_sel)
+                                if comment_items:
+                                    logger.info(f"댓글 아이템 발견: {len(comment_items)}개 ({item_sel[:40]}...)")
+
+                                    for item in comment_items[:20]:
+                                        try:
+                                            # 작성자 찾기: 첫 번째 유효한 프로필 링크 텍스트
+                                            author = None
+                                            author_links = item.find_elements(By.XPATH, ".//a[contains(@href, '/') and @role='link']")
+                                            for link in author_links[:5]:
+                                                link_text = link.text.strip()
+                                                href = link.get_attribute('href') or ''
+                                                # 프로필 링크인지 확인
+                                                if link_text and len(link_text) > 1 and len(link_text) < 50:
+                                                    skip_ui = ['좋아요', '답글', '공유', '더 보기', '번역', 'Like', 'Reply', 'Share',
+                                                               '시간', '분', '일', '주', 'hour', 'min', 'day', 'week']
+                                                    if not any(skip in link_text for skip in skip_ui):
+                                                        # 숫자/통계 텍스트 및 UI 메뉴 제외
+                                                        if not is_stat_text(link_text) and not is_fb_ui_menu(link_text):
+                                                            if 'facebook.com' in href or '/user/' in href or not href.startswith('http'):
+                                                                author = link_text
+                                                                break
+
+                                            # 댓글 텍스트 찾기
+                                            comment_text = None
+                                            # dir='auto' span에서 텍스트 찾기
+                                            spans = item.find_elements(By.XPATH, ".//span[@dir='auto']")
+                                            for span in spans:
+                                                text = span.text.strip()
+                                                if text and len(text) > 5 and text != author:
+                                                    skip_words = ['좋아요', '답글 달기', 'Reply', '공유', '더 보기', '번역',
+                                                                  '동영상에서', '둘러보기', '새로운 소식', '오리지널 오디오']
+                                                    if not any(skip in text for skip in skip_words):
+                                                        # 시간 패턴 및 숫자/통계 제외
+                                                        if not re.match(r'^(\d+\s*(시간|분|일|주|초|hour|min|day|week|sec))', text):
+                                                            if not is_stat_text(text):
+                                                                comment_text = text
+                                                                break
+
+                                            if comment_text and len(comment_text) > 5:
+                                                if not any(c.get('text') == comment_text[:200] for c in comments_list):
+                                                    comments_list.append({
+                                                        "author": author if author else "user",
+                                                        "text": decode_unicode_escapes(comment_text[:200]),
+                                                        "likes": 0
+                                                    })
+                                                    logger.info(f"댓글 추출: author={author}, text={comment_text[:30]}...")
+                                        except Exception as e:
+                                            continue
+                            except Exception as e:
+                                logger.debug(f"댓글 아이템 셀렉터 실패: {e}")
+                                continue
+
+                        # 방법 0-2: 답글 버튼 기준 역추적 (fallback)
+                        if len(comments_list) < 5:
+                            reply_btn_selectors = [
+                                ".//span[text()='답글 달기']",
+                                ".//span[text()='Reply']",
+                                ".//div[@role='button']//span[contains(text(), '답글')]",
+                            ]
+
+                            for reply_sel in reply_btn_selectors:
+                                if len(comments_list) >= 10:
+                                    break
+                                try:
+                                    reply_btns = search_context.find_elements(By.XPATH, reply_sel)
+                                    if reply_btns:
+                                        logger.info(f"답글 버튼 발견: {len(reply_btns)}개")
+
+                                    for btn in reply_btns[:20]:
+                                        try:
+                                            # 답글 버튼에서 부모로 이동하며 댓글 컨테이너 찾기
+                                            # Facebook 2026: 답글 버튼 → 버튼그룹 → 댓글내용div → 댓글컨테이너
+                                            container = btn
+                                            # 4-6단계 위로 올라가서 댓글 전체 컨테이너 찾기
+                                            for level in range(6):
+                                                try:
+                                                    parent = container.find_element(By.XPATH, '..')
+                                                    # 작성자 링크가 있는 레벨인지 확인
+                                                    author_check = parent.find_elements(By.XPATH, ".//a[@role='link'][contains(@href, 'facebook.com') or contains(@href, '/user/')]")
+                                                    if author_check:
+                                                        container = parent
+                                                        break
+                                                    container = parent
+                                                except:
+                                                    break
+
+                                            # 작성자 찾기
+                                            author = None
+                                            author_links = container.find_elements(By.XPATH, ".//a[@role='link']")
+                                            for link in author_links[:5]:
+                                                link_text = link.text.strip()
+                                                if link_text and 1 < len(link_text) < 40:
+                                                    skip_ui = ['좋아요', '답글', '공유', '더 보기', '번역', 'Like', 'Reply', 'Share']
+                                                    if not any(skip in link_text for skip in skip_ui):
+                                                        if not re.match(r'^\d+\s*(시간|분|일|주|hour|min|day|week)', link_text):
+                                                            # 숫자/통계 텍스트 및 UI 메뉴 제외
+                                                            if not is_stat_text(link_text) and not is_fb_ui_menu(link_text):
+                                                                author = link_text
+                                                                break
+
+                                            # 댓글 텍스트 찾기
+                                            comment_text = None
+                                            spans = container.find_elements(By.XPATH, ".//span[@dir='auto']")
+                                            for span in spans:
+                                                text = span.text.strip()
+                                                if text and len(text) > 5 and text != author:
+                                                    skip_words = ['좋아요', '답글', 'reply', '공유', '더 보기', '번역',
+                                                                  '동영상에서', '둘러보기', '새로운 소식']
+                                                    if not any(skip in text.lower() for skip in skip_words):
+                                                        if not re.match(r'^\d+\s*(시간|분|일|주|초)', text):
+                                                            # 숫자/통계 텍스트 제외
+                                                            if not is_stat_text(text):
+                                                                comment_text = text
+                                                                break
+
+                                            if comment_text and len(comment_text) > 5:
+                                                if not any(c.get('text') == comment_text[:200] for c in comments_list):
+                                                    comments_list.append({
+                                                        "author": author if author else "user",
+                                                        "text": decode_unicode_escapes(comment_text[:200]),
+                                                        "likes": 0
+                                                    })
+                                                    logger.info(f"댓글 추출 (답글버튼): author={author}, text={comment_text[:30]}...")
+                                        except Exception as ce:
+                                            continue
+                                except:
+                                    continue
+
+                        if comments_list:
+                            logger.info(f"Facebook 댓글 {len(comments_list)}개 추출 완료")
+
+                        # 방법 1: 기존 컨테이너 방식 (fallback) - 모달 내에서만 검색
+                        if len(comments_list) < 5 and search_context != self.driver:
+                            comment_container_selectors = [
+                                ".//ul//li[.//span[contains(text(),'답글') or contains(text(),'Reply')]]",  # 댓글 리스트 (답글 버튼 있는 것만)
+                            ]
+
+                            for container_sel in comment_container_selectors:
+                                if len(comments_list) >= 10:
+                                    break
+                                try:
+                                    containers = search_context.find_elements(By.XPATH, container_sel)
+                                    for container in containers[:20]:
+                                        try:
+                                            # 컨테이너 내에서 작성자 찾기
+                                            author = None
+                                            try:
+                                                author_elem = container.find_element(By.XPATH, ".//a[@role='link']//span[@dir='auto']")
+                                                author = author_elem.text.strip()
+                                            except:
+                                                pass
+
+                                            # 컨테이너 내에서 댓글 텍스트 찾기
+                                            text = None
+                                            try:
+                                                text_elems = container.find_elements(By.XPATH, ".//span[@dir='auto']")
+                                                for te in text_elems:
+                                                    t = te.text.strip()
+                                                    if t and len(t) > 15 and len(t) < 500 and t != author:
+                                                        skip_words = ['좋아요', 'like', 'reply', '답글', '공유', 'share',
+                                                                    '시간', 'hour', 'day', '분', 'min', '주', 'week',
+                                                                    '더 보기', 'see more', '번역', 'translate',
+                                                                    '동영상에서', '둘러보기', '새로운 소식', '오리지널 오디오',
+                                                                    'reels', 'watch', 'videos from', 'original audio',
+                                                                    '팔로우', 'follow', '구독', 'subscribe',
+                                                                    '홈', 'home', '마켓플레이스', 'marketplace',
+                                                                    '그룹', 'groups', '게임', 'gaming', '메뉴', 'menu']
+                                                        if not any(skip in t.lower() for skip in skip_words):
+                                                            text = t
+                                                            break
+                                            except:
+                                                pass
+
+                                            if text and len(text) > 10:
                                                 if not any(c.get('text') == text[:200] for c in comments_list):
-                                                    # 작성자 이름 할당 (있으면)
-                                                    author = "user"
-                                                    if author_idx < len(dom_author_names):
-                                                        author = dom_author_names[author_idx]
-                                                        author_idx += 1
+                                                    valid_author = author if author and len(author) > 1 and len(author) < 50 else None
+                                                    if valid_author:
+                                                        skip_authors = ['facebook', 'video', 'comment', '좋아요', '답글',
+                                                                       '친구', '그룹', '마켓플레이스', '동영상', 'Watch',
+                                                                       '이벤트', '추억', '저장됨', '과거의 오늘', '메시지',
+                                                                       '알림', '홈', '피드', 'Reels', '게임', '페이지',
+                                                                       # 추가 UI 요소
+                                                                       '광고 관리자', 'Meta Quest', 'Meta Business', 'Ad Manager',
+                                                                       '생일', '날씨', '기금 모금', '쇼핑', 'Shopping',
+                                                                       '첫 번째 동영상', '모든 동영상', '앱센', '메타 AI', 'Meta AI',
+                                                                       '최근 광고 활동', '광고 활동', 'Messenger', 'Instagram',
+                                                                       'WhatsApp', 'Threads', '활동 로그']
+                                                        if any(skip in valid_author for skip in skip_authors):
+                                                            valid_author = None
 
                                                     comments_list.append({
-                                                        "author": author,
+                                                        "author": valid_author if valid_author else "user",
                                                         "text": decode_unicode_escapes(text[:200]),
                                                         "likes": 0
                                                     })
+
                                                     if len(comments_list) >= 10:
                                                         break
+                                        except Exception as ce:
+                                            continue
+                                except:
+                                    continue
+
+                        # 방법 2: 기존 방식 (작성자/텍스트 분리 추출) - fallback, 모달 내에서만 검색
+                        if len(comments_list) < 5 and search_context != self.driver:
+                            logger.debug("방법 2: 모달 내 작성자/텍스트 분리 추출 시도")
+                            dom_author_names = []
+                            try:
+                                author_selectors = [
+                                    ".//a[@role='link']//span[@dir='auto']",
+                                    ".//div[@role='article']//a//span",
+                                ]
+                                for sel in author_selectors:
+                                    try:
+                                        author_elems = search_context.find_elements(By.XPATH, sel)
+                                        for ae in author_elems[:30]:
+                                            try:
+                                                name = ae.text.strip()
+                                                if name and len(name) > 1 and len(name) < 50:
+                                                    skip_names = ['facebook', 'video', 'comment', 'like', '좋아요',
+                                                                '답글', 'share', '공유', 'reply', '더 보기',
+                                                                '시간', 'hour', 'day', '분', 'min', '주', 'week',
+                                                                '친구', '그룹', '마켓플레이스', '동영상', 'Watch',
+                                                                '이벤트', '추억', '저장됨', '과거의 오늘', '메시지',
+                                                                '알림', '홈', '피드', 'Reels', '게임', '페이지',
+                                                                '뉴스피드', '스토리', '모두 보기',
+                                                                # 추가 UI 요소
+                                                                '광고 관리자', 'Meta Quest', 'Meta Business', 'Ad Manager',
+                                                                '생일', '날씨', '기금 모금', '쇼핑', 'Shopping',
+                                                                '첫 번째 동영상', '모든 동영상', '앱센', '메타 AI', 'Meta AI',
+                                                                '최근 광고 활동', '광고 활동', 'Messenger', 'Instagram',
+                                                                'WhatsApp', 'Threads', '활동 로그']
+                                                    if not any(skip in name for skip in skip_names):
+                                                        if not name.replace(',', '').replace('.', '').isdigit():
+                                                            if name not in dom_author_names:
+                                                                dom_author_names.append(name)
+                                            except:
+                                                pass
                                     except:
-                                        continue
+                                        pass
                             except:
-                                continue
+                                pass
+
+                            dom_selectors = [
+                                ".//div[@role='article']//span[@dir='auto'][string-length(text()) > 15]",
+                                ".//ul//li//span[@dir='auto'][string-length(text()) > 15]",
+                                ".//div[contains(@class, 'x1lliihq')]//span[string-length(text()) > 15]",
+                            ]
+
+                            author_idx = 0
+                            for selector in dom_selectors:
+                                if len(comments_list) >= 10:
+                                    break
+                                try:
+                                    elements = search_context.find_elements(By.XPATH, selector)
+                                    for elem in elements[:15]:
+                                        try:
+                                            text = elem.text.strip()
+                                            if text and len(text) > 15 and len(text) < 300:
+                                                skip_words = ['좋아요', 'like', 'reply', '답글', '공유', 'share',
+                                                            '시간', 'hour', 'day', '분', 'min', '더 보기',
+                                                            # Facebook UI/네비게이션 요소 필터
+                                                            '동영상에서', '둘러보기', '새로운 소식', '오리지널 오디오',
+                                                            'reels', 'watch', 'videos from', 'original audio',
+                                                            '팔로우', 'follow', '구독', 'subscribe',
+                                                            '홈', 'home', '마켓플레이스', 'marketplace',
+                                                            '그룹', 'groups', '게임', 'gaming', '메뉴', 'menu']
+                                                if not any(skip in text.lower() for skip in skip_words):
+                                                    if not any(c.get('text') == text[:200] for c in comments_list):
+                                                        author = "user"
+                                                        if author_idx < len(dom_author_names):
+                                                            author = dom_author_names[author_idx]
+                                                            author_idx += 1
+
+                                                        comments_list.append({
+                                                            "author": author,
+                                                            "text": decode_unicode_escapes(text[:200]),
+                                                            "likes": 0
+                                                        })
+                                                        if len(comments_list) >= 10:
+                                                            break
+                                        except:
+                                            continue
+                                except:
+                                    continue
 
                     if comments_list:
                         result["comments_list"] = comments_list
+                        # 댓글 수가 0이면 추출된 댓글 리스트 길이 사용
+                        if result["comments"] == 0:
+                            result["comments"] = len(comments_list)
                         logger.info(f"Facebook 댓글 {len(comments_list)}개 수집")
                 except Exception as ce:
                     logger.debug(f"Facebook 댓글 추출 실패: {ce}")
 
-            # JSON에서 engagement를 찾았으면 DOM 파싱 스킵
-            if result["likes"] > 0 or result["comments"] > 0:
-                logger.info("JSON 데이터 추출 성공")
-                return result
-
-            # === DOM 기반 engagement 데이터 추출 (fallback) ===
-            result["likes"] = self._extract_reactions(self.driver)
-            result["comments"] = self._extract_comments_count(self.driver)
-            result["shares"] = self._extract_shares_count(self.driver)
-            result["views"] = self._extract_views_count(self.driver)
+            # 댓글 내용 수집
+            if self.collect_comments:
+                result["comment_list"] = self._extract_comment_list(self.driver, self.max_comments)
 
             logger.info(
                 f"데이터 추출 완료: likes={result['likes']}, "
@@ -1962,9 +3222,177 @@ class FacebookCrawler:
             result["error"] = str(e)
             return result
 
+    def _scope_source_by_post_id(self, page_source: str, url: str) -> str:
+        """
+        타겟 포스트 ID를 기반으로 page_source를 스코핑하여
+        추천/관련 게시물의 데이터가 섞이지 않도록 함
+
+        Args:
+            page_source: 전체 페이지 소스
+            url: 원본 게시물 URL
+
+        Returns:
+            스코핑된 소스 (실패 시 전체 소스 반환)
+        """
+        SCOPE_RADIUS = 15000  # ±15000자 컨텍스트 윈도우
+
+        # engagement 데이터 존재 확인용 키워드
+        engagement_indicators = [
+            '"reaction_count"', '"like_count"', '"comment_count"',
+            '"share_count"', '"i18n_reaction_count"', '"feedback_reaction_count"',
+            '"video_reaction_count"', '"ufi_reaction_count"',
+        ]
+
+        def _try_scope_at(pos: int) -> Optional[str]:
+            """특정 위치에서 스코핑 시도, engagement 데이터 있으면 반환"""
+            start = max(0, pos - SCOPE_RADIUS)
+            end = min(len(page_source), pos + SCOPE_RADIUS)
+            window = page_source[start:end]
+            for indicator in engagement_indicators:
+                if indicator in window:
+                    return window
+            return None
+
+        # 1. URL에서 포스트 ID 추출
+        post_id = self._extract_post_id_from_url(url)
+        if not post_id:
+            try:
+                post_id = self._extract_post_id_from_url(self.driver.current_url)
+            except Exception:
+                pass
+
+        if post_id:
+            logger.debug(f"스코핑용 포스트 ID: {post_id}")
+
+            # 2a. pfbid URL인 경우: page_source에 pfbid 문자열이 없을 수 있음
+            # → 작성자 슬러그 + engagement 동시 매칭으로 정확한 데이터 블록 탐색
+            if post_id.startswith('pfbid'):
+                # pfbid 자체를 먼저 검색
+                pfbid_pos = page_source.find(post_id)
+                if pfbid_pos >= 0:
+                    scoped = _try_scope_at(pfbid_pos)
+                    if scoped:
+                        logger.info(f"pfbid 스코핑 성공 (pos={pfbid_pos})")
+                        return scoped
+
+                # URL에서 작성자 슬러그 추출 (facebook.com/USERNAME/posts/pfbid...)
+                author_slug = None
+                url_author_match = re.search(r'facebook\.com/([^/?]+)/posts/', url)
+                if url_author_match:
+                    author_slug = url_author_match.group(1)
+                    logger.debug(f"pfbid 스코핑: 작성자 슬러그 '{author_slug}'")
+
+                # 모든 story_fbid 위치를 탐색하여 작성자+engagement 동시 매칭 우선
+                author_engagement_pos = None  # 작성자 + engagement 동시 매칭 (최우선)
+                engagement_only_pos = None     # engagement만 매칭 (차선)
+                best_engagement_count = 0      # engagement 지표 개수 (더 많을수록 타겟일 확률 높음)
+                search_start = 0
+                while True:
+                    story_match = re.search(r'"story_fbid":"(\d{10,})"', page_source[search_start:])
+                    if not story_match:
+                        break
+                    actual_pos = search_start + story_match.start()
+
+                    start = max(0, actual_pos - SCOPE_RADIUS)
+                    end = min(len(page_source), actual_pos + SCOPE_RADIUS)
+                    window = page_source[start:end]
+
+                    has_engagement = any(ind in window for ind in engagement_indicators)
+                    has_author = author_slug and (
+                        f'"{author_slug}"' in window or
+                        f'/{author_slug}/' in window or
+                        f'\\/{author_slug}\\/' in window or
+                        f'/{author_slug}' in window or  # URL 경로 끝
+                        f'\\/{author_slug}' in window or  # escaped URL 경로 끝
+                        (len(author_slug) >= 8 and author_slug in window)  # 8자 이상이면 plain 매칭
+                    )
+
+                    engagement_count = sum(1 for ind in engagement_indicators if ind in window)
+
+                    if has_engagement and has_author and author_engagement_pos is None:
+                        author_engagement_pos = actual_pos
+                        logger.info(
+                            f"pfbid → 작성자({author_slug})+engagement 매칭: "
+                            f"story_fbid={story_match.group(1)} (pos={actual_pos}, indicators={engagement_count})"
+                        )
+                        break  # 최우선 매칭 발견
+                    elif has_engagement:
+                        # engagement 지표가 더 많은 위치 = 타겟 포스트일 확률 높음
+                        if engagement_only_pos is None or engagement_count > best_engagement_count:
+                            engagement_only_pos = actual_pos
+                            best_engagement_count = engagement_count
+
+                    search_start = actual_pos + 1
+
+                # 최우선: 작성자+engagement, 차선: engagement만
+                best_pos = author_engagement_pos or engagement_only_pos
+                if best_pos is not None:
+                    start = max(0, best_pos - SCOPE_RADIUS)
+                    end = min(len(page_source), best_pos + SCOPE_RADIUS)
+                    scoped = page_source[start:end]
+                    if author_engagement_pos:
+                        logger.info(f"pfbid 작성자 기반 스코핑 성공 (pos={best_pos})")
+                    else:
+                        logger.info(f"pfbid engagement 스코핑 (작성자 미매칭, pos={best_pos})")
+                    return scoped
+
+            else:
+                # 2b. 숫자 ID인 경우: 모든 출현 위치를 탐색하여 engagement 데이터가 있는 곳 선택
+                specific_patterns = [
+                    f'"post_id":"{post_id}"',
+                    f'"story_fbid":"{post_id}"',
+                    f'"videoID":"{post_id}"',
+                    f'"video_id":"{post_id}"',
+                    f'"id":"{post_id}"',
+                ]
+
+                # 1차: 모든 패턴의 모든 출현 위치에서 engagement 데이터가 있는 곳 탐색
+                fallback_pos = None  # engagement 없어도 ID가 있는 첫 위치
+                for pattern in specific_patterns:
+                    search_start = 0
+                    while True:
+                        pos = page_source.find(pattern, search_start)
+                        if pos < 0:
+                            break
+                        if fallback_pos is None:
+                            fallback_pos = pos
+                        scoped = _try_scope_at(pos)
+                        if scoped:
+                            logger.info(f"포스트 스코핑 성공: '{pattern[:40]}' (pos={pos})")
+                            return scoped
+                        search_start = pos + 1
+
+                # 2차: 순수 ID 문자열의 모든 출현 위치 탐색 (10자리 이상)
+                if len(post_id) >= 10:
+                    search_str = f'"{post_id}"'
+                    search_start = 0
+                    while True:
+                        pos = page_source.find(search_str, search_start)
+                        if pos < 0:
+                            break
+                        if fallback_pos is None:
+                            fallback_pos = pos
+                        scoped = _try_scope_at(pos)
+                        if scoped:
+                            logger.info(f"포스트 스코핑 (순수 ID): '{post_id}' (pos={pos})")
+                            return scoped
+                        search_start = pos + 1
+
+                # 3차: engagement 없어도 ID가 있는 위치 기반 스코핑
+                if fallback_pos is not None:
+                    start = max(0, fallback_pos - SCOPE_RADIUS)
+                    end = min(len(page_source), fallback_pos + SCOPE_RADIUS)
+                    scoped = page_source[start:end]
+                    logger.info(f"포스트 스코핑 (engagement 미확인, fallback): pos={fallback_pos}")
+                    return scoped
+
+        # 3. 스코핑 실패 시 전체 소스 반환
+        logger.warning(f"포스트 ID '{post_id}'를 소스에서 찾지 못함, 전체 소스 사용")
+        return page_source
+
     def _try_javascript_extraction(self, result: dict) -> None:
         """
-        JavaScript를 통한 데이터 추출 시도
+        JavaScript를 통한 데이터 추출 시도 (포스트 ID 스코핑 적용)
 
         Args:
             result: 결과 딕셔너리 (업데이트됨)
@@ -1972,15 +3400,18 @@ class FacebookCrawler:
         try:
             page_source = self.driver.page_source
 
+            # 타겟 포스트 ID 기반 스코핑 (추천 게시물 데이터 혼입 방지)
+            search_source = self._scope_source_by_post_id(page_source, result.get("url", ""))
+
             # 반응 수 추출 (다양한 패턴 시도)
             reaction_patterns = [
-                # 2025-2026년 Facebook Reel/Video 패턴
-                r'"reaction_count_reduced":"([\d,\.KMkm]+)"',
+                # 2025-2026년 Facebook Reel/Video 패턴 (한국어 천/만/억 포함)
+                r'"reaction_count_reduced":"([\d,\.KMkm천만억]+)"',
                 r'"video_reaction_count":(\d+)',
                 r'"ufi_reaction_count":(\d+)',
-                # 2026년 새 패턴 - i18n_reaction_count (JSON escape 버전)
-                r'\"i18n_reaction_count\":\"([\d,\.KMkm]+)\"',
-                r'"i18n_reaction_count":"([\d,\.KMkm]+)"',
+                # 2026년 새 패턴 - i18n_reaction_count (JSON escape 버전, 한국어 포함)
+                r'\"i18n_reaction_count\":\"([\d,\.KMkm천만억]+)\"',
+                r'"i18n_reaction_count":"([\d,\.KMkm천만억]+)"',
                 # reaction_count (JSON escape 버전)
                 r'\"reaction_count\":\{\"count\":(\d+)',
                 r'"reaction_count":\{"count":(\d+)',
@@ -1997,17 +3428,15 @@ class FacebookCrawler:
                 r'"unified_reactors":\{"count":(\d+)',
             ]
             for pattern in reaction_patterns:
-                matches = re.findall(pattern, page_source, re.IGNORECASE)
-                if matches:
-                    # 가장 큰 값 사용 (여러 값이 있을 경우) - K/M 표기 지원
-                    parsed_counts = [self._parse_count(str(m)) for m in matches]
-                    max_count = max(parsed_counts) if parsed_counts else 0
-                    if max_count > 0:
-                        result["likes"] = max_count
-                        logger.info(f"JSON에서 반응 수 추출: {max_count}")
+                match = re.search(pattern, search_source, re.IGNORECASE)
+                if match:
+                    count = self._parse_count(str(match.group(1)))
+                    if count > 0:
+                        result["likes"] = count
+                        logger.info(f"JSON에서 반응 수 추출 (스코핑): {count}")
                         break
 
-            # 댓글 수 추출 (첫 번째 유효한 값 사용 - max 사용 시 잘못된 값 선택 위험)
+            # 댓글 수 추출 (스코핑된 소스에서 검색)
             comment_patterns = [
                 # 2025-2026년 Video/Reel 패턴 (가장 정확)
                 r'"video_comment_count":(\d+)',
@@ -2021,30 +3450,29 @@ class FacebookCrawler:
                 r'"commentcount"\s*:\s*(\d+)',
             ]
             for pattern in comment_patterns:
-                match = re.search(pattern, page_source, re.IGNORECASE)
+                match = re.search(pattern, search_source, re.IGNORECASE)
                 if match:
                     count = self._parse_count(str(match.group(1)))
-                    # 검증: 댓글 수가 100만 이상이면 의심스러움 (일반적으로 댓글은 좋아요보다 훨씬 적음)
                     if count > 0 and count < 1000000:
                         result["comments"] = count
-                        logger.info(f"JSON에서 댓글 수 추출: {count}")
+                        logger.info(f"JSON에서 댓글 수 추출 (스코핑): {count}")
                         break
                     elif count >= 1000000:
                         logger.warning(f"비정상적으로 큰 댓글 수 무시: {count}")
 
-            # 공유 수 추출
+            # 공유 수 추출 (스코핑된 소스에서 검색)
             share_patterns = [
                 r'\"share_count\":\{\"count\":(\d+)',
                 r'"share_count"\s*:\s*\{"count"\s*:\s*(\d+)',
                 r'"sharecount"\s*:\s*(\d+)',
             ]
             for pattern in share_patterns:
-                matches = re.findall(pattern, page_source, re.IGNORECASE)
-                if matches:
-                    max_count = max(int(m) for m in matches)
-                    if max_count > 0:
-                        result["shares"] = max_count
-                        logger.info(f"JSON에서 공유 수 추출: {max_count}")
+                match = re.search(pattern, search_source, re.IGNORECASE)
+                if match:
+                    count = int(match.group(1))
+                    if count > 0:
+                        result["shares"] = count
+                        logger.info(f"JSON에서 공유 수 추출 (스코핑): {count}")
                         break
 
         except Exception as e:
@@ -2087,6 +3515,30 @@ class FacebookCrawler:
                 "error": f"유효하지 않은 Facebook URL입니다. facebook.com 도메인이 포함된 URL을 입력해주세요.",
                 "error_type": "validation_error"
             }
+
+        # share/v 단축 URL 처리 - 실제 URL로 리다이렉트
+        original_url = url
+        if "/share/v/" in url or "/share/p/" in url or "/share/r/" in url:
+            logger.info(f"Facebook 단축 URL 감지, 리다이렉트 처리: {url}")
+            try:
+                # requests로 리다이렉트 따라가기
+                response = requests.head(url, allow_redirects=True, timeout=10,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+                if response.url and response.url != url:
+                    url = response.url
+                    logger.info(f"리다이렉트된 URL: {url}")
+            except Exception as e:
+                logger.warning(f"리다이렉트 처리 실패, 원본 URL 사용: {e}")
+                # Selenium으로 리다이렉트 처리 시도
+                if self.driver is None:
+                    self.driver = self._create_driver()
+                try:
+                    self.driver.get(original_url)
+                    time.sleep(3)
+                    url = self.driver.current_url
+                    logger.info(f"Selenium 리다이렉트 URL: {url}")
+                except Exception as e2:
+                    logger.warning(f"Selenium 리다이렉트도 실패: {e2}")
 
         # 1. API 방식 우선 시도 (쿠키 인증 포함)
         if self.use_api and self.session:

@@ -7,6 +7,7 @@ v2.0 - 플랫폼 쿠키 인증 지원
 
 import sys
 import os
+import json
 import logging
 import platform as sys_platform
 from datetime import datetime, timedelta
@@ -69,6 +70,15 @@ from src.crawlers import (
     crawl_dcard_post,
     crawl_dcard_posts,
 )
+
+# 조회수 수집 가능 플랫폼 (True = 수집 가능, False = 수집 불가)
+PLATFORM_VIEW_SUPPORT = {
+    "youtube": True,       # YouTube는 조회수 공개
+    "instagram": False,    # Instagram 일반 게시물은 조회수 비공개 (릴스만 제공)
+    "facebook": False,     # Facebook 공개 페이지도 조회수 비공개
+    "xiaohongshu": False,  # 샤오홍슈 조회수 비공개
+    "dcard": False,        # Dcard 조회수 비공개
+}
 
 # 페이지 설정
 st.set_page_config(
@@ -189,12 +199,13 @@ def render_sidebar():
         # 지원 플랫폼 안내
         st.markdown("---")
         st.markdown("### 지원 플랫폼")
+        st.caption("✅=OK, 🔑=쿠키저장(만료가능), ⚠️=미설정")
         for platform, display_name in PLATFORM_DISPLAY_NAMES.items():
             # 인증 상태 표시
             if platform == "youtube":
                 status = "✅"  # YouTube는 항상 OK
             elif is_platform_authenticated(platform):
-                status = "✅"
+                status = "🔑"  # 쿠키 설정됨 (만료 가능)
             else:
                 status = "⚠️"
             st.markdown(f"- {status} {display_name}")
@@ -431,28 +442,57 @@ def crawl_with_cookies(platform: str, url: str, auth_mode: bool = False) -> dict
         # 다른 플랫폼은 쿠키와 함께 크롤링
         if platform == "instagram":
             from src.crawlers.instagram_crawler import InstagramCrawler
-            with InstagramCrawler(headless=use_headless, use_api=True) as crawler_instance:
+
+            # 사이드바 쿠키를 파일로 저장 (Selenium fallback용)
+            if cookies:
+                cookie_file = Path(__file__).parent.parent / "data" / "cookies" / "instagram_cookies.json"
+                cookie_file.parent.mkdir(parents=True, exist_ok=True)
+                cookie_list = [
+                    {"name": name, "value": value, "domain": ".instagram.com", "path": "/", "secure": True, "httpOnly": True}
+                    for name, value in cookies.items()
+                ]
+                with open(cookie_file, "w", encoding="utf-8") as f:
+                    json.dump(cookie_list, f, ensure_ascii=False, indent=2)
+                logger.info(f"Instagram 쿠키 파일 저장: {list(cookies.keys())}")
+
+            with InstagramCrawler(headless=use_headless, use_api=True, collect_comments=True) as crawler_instance:
                 if cookies and crawler_instance.session:
                     apply_cookies_to_session(crawler_instance.session, cookies, domain)
                 return crawler_instance.crawl_post(url)
 
         elif platform == "facebook":
             from src.crawlers.facebook_crawler import FacebookCrawler
-            with FacebookCrawler(headless=use_headless, use_api=True) as crawler_instance:
-                if cookies and crawler_instance.session:
-                    apply_cookies_to_session(crawler_instance.session, cookies, domain)
-                return crawler_instance.crawl_post(url)
+
+            # 사이드바 쿠키를 파일로 저장 (Selenium fallback용)
+            if cookies:
+                cookie_file = Path(__file__).parent.parent / "data" / "cookies" / "facebook_cookies.json"
+                cookie_file.parent.mkdir(parents=True, exist_ok=True)
+                cookie_list = [
+                    {"name": name, "value": value, "domain": ".facebook.com", "path": "/", "secure": True, "httpOnly": True}
+                    for name, value in cookies.items()
+                ]
+                with open(cookie_file, "w", encoding="utf-8") as f:
+                    json.dump(cookie_list, f, ensure_ascii=False, indent=2)
+                logger.info(f"Facebook 쿠키 파일 저장: {list(cookies.keys())}")
+
+            # Selenium 사용 (쿠키 파일 자동 로드)
+            with FacebookCrawler(headless=use_headless, use_api=False, use_scraper=False, use_mobile=False, collect_comments=False) as crawler_instance:
+                result = crawler_instance.crawl_post(url)
+                logger.info(f"Facebook 결과: likes={result.get('likes')}, comments={result.get('comments')}")
+                return result
 
         elif platform == "xiaohongshu":
             from src.crawlers.xhs_crawler import XHSCrawler
-            with XHSCrawler(headless=use_headless, use_api=True) as crawler_instance:
+            # use_api=False로 QR 로그인 강제 (API는 잘못된 게시물 반환 가능)
+            with XHSCrawler(headless=False, use_api=False, collect_comments=True) as crawler_instance:
                 if cookies and crawler_instance.session:
                     apply_cookies_to_session(crawler_instance.session, cookies, domain)
                 return crawler_instance.crawl_post(url)
 
         elif platform == "dcard":
             from src.crawlers.dcard_crawler import DcardCrawler
-            with DcardCrawler(headless=use_headless, use_api=True) as crawler_instance:
+            # Dcard는 Cloudflare 우회를 위해 항상 브라우저 표시 (headless=False)
+            with DcardCrawler(headless=False, use_api=True) as crawler_instance:
                 if cookies and hasattr(crawler_instance, 'scraper'):
                     apply_cookies_to_session(crawler_instance.scraper, cookies, domain)
                 return crawler_instance.crawl_post(url)
@@ -492,11 +532,11 @@ def is_crawl_result_valid(result: dict) -> bool:
 
     # 필수 데이터 확인: 작성자 또는 상호작용 수치 중 하나는 있어야 함
     has_author = bool(result.get("author"))
-    has_likes = result.get("likes", 0) > 0
-    has_comments = result.get("comments", 0) > 0
-    has_views = result.get("views", 0) > 0 if result.get("views") is not None else False
-    has_favorites = result.get("favorites", 0) > 0
-    has_shares = result.get("shares", 0) > 0
+    has_likes = (result.get("likes") or 0) > 0
+    has_comments = (result.get("comments") or 0) > 0
+    has_views = (result.get("views") or 0) > 0
+    has_favorites = (result.get("favorites") or 0) > 0
+    has_shares = (result.get("shares") or 0) > 0
 
     # YouTube: 조회수가 핵심 지표
     if platform == "youtube":
@@ -649,12 +689,19 @@ def run_crawling():
         p = u.get("platform", "unknown")
         platform_counts[p] = platform_counts.get(p, 0) + 1
 
-    # 샤오홍슈가 포함된 경우 QR 인증 안내 표시
-    if "xiaohongshu" in platform_counts:
+    # 샤오홍슈가 포함된 경우 인증 모드 자동 활성화 + QR 인증 안내 표시
+    if "xiaohongshu" in platform_counts and IS_LOCAL:
         xhs_count = platform_counts["xiaohongshu"]
+        # 인증 모드 자동 활성화 (QR 스캔을 위해 브라우저 창 필요)
+        if not st.session_state.get("auth_mode", False):
+            st.session_state.auth_mode = True
+            st.info(
+                f"**샤오홍슈 URL 감지 ({xhs_count}개)** - 인증 모드가 자동 활성화되었습니다.\n\n"
+                "QR 코드 스캔을 위해 브라우저 창이 열립니다."
+            )
         st.warning(
             f"**샤오홍슈 QR 인증 안내** ({xhs_count}개 URL)\n\n"
-            "샤오홍슈 크롤링 시 QR 코드 인증이 필요할 수 있습니다.\n"
+            "샤오홍슈 크롤링 시 QR 코드 인증이 필요합니다.\n"
             "- 브라우저 창이 열리면 QR 코드를 확인하세요\n"
             "- 샤오홍슈 앱으로 QR 코드를 스캔하여 인증하세요\n"
             "- 인증 완료 후 자동으로 크롤링이 진행됩니다"
@@ -685,25 +732,110 @@ def run_crawling():
     result_container = st.container()
 
     total = len(valid_urls)
-    current_platform = None
 
-    for i, url_info in enumerate(valid_urls):
+    # === 샤오홍슈 배치 처리 (한 번의 로그인으로 모든 URL 처리) ===
+    xhs_urls = [u for u in valid_urls if u.get("platform") == "xiaohongshu"]
+    other_urls = [u for u in valid_urls if u.get("platform") != "xiaohongshu"]
+    xhs_results = {}  # URL -> result 매핑
+
+    if xhs_urls and IS_LOCAL:
+        platform_info = get_platform_crawl_info("xiaohongshu")
+        platform_status.info(
+            f"**{platform_info['display_name']} 배치 크롤링 시작** ({len(xhs_urls)}개 URL)\n\n"
+            "QR 코드 인증이 필요하면 브라우저 창을 확인하세요.\n"
+            "**한 번만 인증하면 모든 URL이 처리됩니다.**"
+        )
+        status_text.markdown(f"**샤오홍슈 배치 처리 준비 중...** ({len(xhs_urls)}개 URL)")
+
+        try:
+            from src.crawlers.xhs_crawler import XHSCrawler
+
+            with XHSCrawler(headless=False, use_api=False, collect_comments=True) as xhs_crawler:
+                for idx, url_info in enumerate(xhs_urls):
+                    url = url_info.get("url")
+                    progress_bar.progress((idx + 1) / total)
+                    status_text.markdown(
+                        f"**샤오홍슈 크롤링 중:** {idx + 1}/{len(xhs_urls)} - {url[:50]}..."
+                    )
+
+                    try:
+                        # 첫 번째 URL에서만 로그인 시도
+                        result = xhs_crawler.crawl_post(url, auto_login=(idx == 0))
+                        xhs_results[url] = result
+
+                        # 결과 표시
+                        is_valid = is_crawl_result_valid(result)
+                        if is_valid:
+                            metrics = []
+                            if result.get("likes", 0) > 0:
+                                metrics.append(f"좋아요 {result['likes']}")
+                            if result.get("comments", 0) > 0:
+                                metrics.append(f"댓글 {result['comments']}")
+                            metrics_str = ", ".join(metrics) if metrics else "데이터 수집됨"
+                            with result_container:
+                                st.markdown(f"**샤오홍슈 {idx + 1}** - 성공 ({metrics_str})")
+                        else:
+                            with result_container:
+                                st.markdown(f"**샤오홍슈 {idx + 1}** - 실패: {result.get('error', '데이터 없음')[:50]}")
+
+                        time.sleep(2)  # Rate limiting
+
+                    except Exception as e:
+                        logger.error(f"샤오홍슈 크롤링 오류 ({url}): {e}")
+                        xhs_results[url] = {
+                            "platform": "xiaohongshu",
+                            "url": url,
+                            "error": str(e),
+                            "crawled_at": datetime.now().isoformat(),
+                        }
+
+                platform_status.success(f"**샤오홍슈 배치 크롤링 완료!** ({len(xhs_urls)}개 URL)")
+
+        except Exception as e:
+            logger.error(f"샤오홍슈 배치 처리 오류: {e}")
+            platform_status.error(f"**샤오홍슈 배치 처리 오류:** {str(e)}")
+            # 실패한 URL들에 에러 결과 추가
+            for url_info in xhs_urls:
+                url = url_info.get("url")
+                if url not in xhs_results:
+                    xhs_results[url] = {
+                        "platform": "xiaohongshu",
+                        "url": url,
+                        "error": str(e),
+                        "crawled_at": datetime.now().isoformat(),
+                    }
+
+    # === 플랫폼별 배치 크롤링 (세션 재사용으로 속도 최적화) ===
+    # 같은 플랫폼의 URL을 하나의 브라우저 세션으로 처리하여 브라우저 시작 오버헤드 제거
+
+    # 플랫폼별 URL 그룹화 (샤오홍슈는 이미 배치 처리됨)
+    platform_url_groups = {}  # platform -> [url_info, ...]
+    for url_info in valid_urls:
+        p = url_info.get("platform")
         url = url_info.get("url")
-        platform = url_info.get("platform")
+        # 샤오홍슈 배치 처리 결과 바로 추가
+        if p == "xiaohongshu" and url in xhs_results:
+            results.append(xhs_results[url])
+            continue
+        if p not in platform_url_groups:
+            platform_url_groups[p] = []
+        platform_url_groups[p].append(url_info)
+
+    processed_count = len(xhs_results)
+    auth_mode = st.session_state.get("auth_mode", False)
+
+    # 플랫폼별 배치 처리
+    for platform, url_group in platform_url_groups.items():
         platform_info = get_platform_crawl_info(platform)
 
-        # 플랫폼이 바뀌면 안내 메시지 업데이트
-        if platform != current_platform:
-            current_platform = platform
-
-            # 샤오홍슈 시작 시 특별 안내
-            if platform == "xiaohongshu":
-                platform_status.info(
-                    f"**{platform_info['display_name']} 크롤링 시작**\n\n"
-                    "QR 코드 인증이 필요하면 브라우저 창을 확인하세요.\n"
-                    "인증 대기 중일 수 있습니다..."
-                )
-            elif platform_info.get("requires_auth"):
+        # 배치 크롤링 안내
+        if len(url_group) > 1:
+            platform_status.info(
+                f"**{platform_info['display_name']} 배치 크롤링** ({len(url_group)}개 URL)\n\n"
+                f"하나의 세션으로 모든 URL을 처리합니다."
+            )
+        else:
+            if platform_info.get("requires_auth"):
                 platform_status.info(
                     f"**{platform_info['display_name']} 크롤링 중**\n\n"
                     f"{platform_info.get('auth_message', '')}"
@@ -714,117 +846,245 @@ def run_crawling():
                     f"예상 소요 시간: URL당 {platform_info['estimated_time']}"
                 )
 
-        status_text.markdown(
-            f"**진행 중:** {i + 1}/{total} - "
-            f"{platform_info['display_name']} - {url[:50]}..."
-        )
-        progress_bar.progress((i + 1) / total)
+        # 인증 안내
+        if platform == "dcard" and auth_mode:
+            platform_status.warning(
+                f"**{platform_info['display_name']} - Cloudflare 인증 대기 중...**\n\n"
+                "브라우저 창에 Cloudflare 인증이 나타나면 완료해주세요.\n"
+                "인증 후 자동으로 진행됩니다."
+            )
+        elif platform == "xiaohongshu" and auth_mode:
+            platform_status.warning(
+                f"**{platform_info['display_name']} - QR 인증 대기 중...**\n\n"
+                "브라우저 창에 QR 코드가 나타나면 샤오홍슈 앱으로 스캔하세요.\n"
+                "인증 후 자동으로 진행됩니다."
+            )
+
+        # YouTube 및 기타 플랫폼: 세션 불필요, 기존 방식 유지
+        if platform not in ["facebook", "instagram", "dcard"]:
+            for url_info in url_group:
+                url = url_info.get("url")
+                processed_count += 1
+                progress_bar.progress(processed_count / total)
+                status_text.markdown(
+                    f"**진행 중:** {processed_count}/{total} - "
+                    f"{platform_info['display_name']} - {url[:50]}..."
+                )
+                try:
+                    result = crawl_with_cookies(platform, url, auth_mode=auth_mode)
+                    results.append(result)
+                    is_valid = is_crawl_result_valid(result)
+                    if is_valid:
+                        metrics = []
+                        if result.get("likes", 0) > 0:
+                            metrics.append(f"좋아요 {result['likes']}")
+                        if result.get("comments", 0) > 0:
+                            metrics.append(f"댓글 {result['comments']}")
+                        if result.get("views") and result.get("views", 0) > 0:
+                            metrics.append(f"조회수 {result['views']}")
+                        metrics_str = ", ".join(metrics) if metrics else "데이터 수집됨"
+                        with result_container:
+                            st.markdown(
+                                f"**{processed_count}. {platform_info['display_name']}** - 성공 ({metrics_str})"
+                            )
+                    else:
+                        failure_reason = get_crawl_failure_reason(result)
+                        if not result.get("error"):
+                            result["error"] = failure_reason or "데이터 수집 실패"
+                        with result_container:
+                            st.markdown(
+                                f"**{processed_count}. {platform_info['display_name']}** - "
+                                f"실패: {failure_reason or result.get('error', '')[:50]}"
+                            )
+                        if platform == "xiaohongshu":
+                            error_msg = f"**{platform_info['display_name']} - 데이터 수집 실패**\n\n"
+                            if IS_LOCAL and not auth_mode:
+                                error_msg += "**해결 방법:**\n"
+                                error_msg += "1. 사이드바에서 '인증 모드'를 활성화하세요\n"
+                                error_msg += "2. 브라우저 창에서 QR 코드를 스캔하세요\n"
+                                error_msg += "또는 쿠키를 직접 입력해주세요."
+                            else:
+                                error_msg += "QR 인증이 필요하거나 쿠키가 만료되었을 수 있습니다.\n"
+                                error_msg += "사이드바에서 쿠키를 다시 설정해주세요."
+                            platform_status.error(error_msg)
+                except Exception as e:
+                    logger.error(f"크롤링 오류 ({url}): {e}")
+                    results.append({
+                        "platform": platform, "url": url,
+                        "error": str(e), "crawled_at": datetime.now().isoformat(),
+                    })
+                    with result_container:
+                        st.markdown(
+                            f"**{processed_count}. {platform_info['display_name']}** - 오류: {str(e)[:50]}"
+                        )
+                time.sleep(1)
+            continue
+
+        # === Facebook, Instagram, Dcard: 세션 재사용 배치 크롤링 ===
+        cookies = get_platform_cookies(platform)
+        domain = PLATFORM_DOMAINS.get(platform, "")
+        has_cookies = bool(cookies)
+
+        # headless 모드 결정 (Dcard는 항상 브라우저 표시)
+        if platform == "dcard":
+            use_headless = False
+        elif IS_CLOUD:
+            use_headless = True
+        elif auth_mode:
+            use_headless = False
+        elif has_cookies:
+            use_headless = True
+        else:
+            use_headless = True
+
+        # 쿠키 파일 저장 (세션 시작 전 한 번만)
+        if cookies and platform in ["facebook", "instagram"]:
+            cookie_domain = ".facebook.com" if platform == "facebook" else ".instagram.com"
+            cookie_file = Path(__file__).parent.parent / "data" / "cookies" / f"{platform}_cookies.json"
+            cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            cookie_list = [
+                {"name": name, "value": value, "domain": cookie_domain, "path": "/", "secure": True, "httpOnly": True}
+                for name, value in cookies.items()
+            ]
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                json.dump(cookie_list, f, ensure_ascii=False, indent=2)
+            logger.info(f"{platform} 쿠키 파일 저장 완료")
 
         try:
-            # 인증 모드 가져오기
-            auth_mode = st.session_state.get("auth_mode", False)
-
-            # 인증이 필요한 플랫폼 안내 표시
-            if platform == "xiaohongshu" and auth_mode:
-                platform_status.warning(
-                    f"**{platform_info['display_name']} - QR 인증 대기 중...**\n\n"
-                    "브라우저 창에 QR 코드가 나타나면 샤오홍슈 앱으로 스캔하세요.\n"
-                    "인증 후 자동으로 진행됩니다."
+            # 크롤러 인스턴스 생성 (플랫폼당 1회)
+            if platform == "facebook":
+                from src.crawlers.facebook_crawler import FacebookCrawler
+                crawler_instance = FacebookCrawler(
+                    headless=use_headless, use_api=False, use_scraper=False,
+                    use_mobile=False, collect_comments=False
                 )
-            elif platform == "dcard" and auth_mode:
-                platform_status.warning(
-                    f"**{platform_info['display_name']} - Cloudflare 인증 대기 중...**\n\n"
-                    "브라우저 창에 Cloudflare 인증이 나타나면 완료해주세요.\n"
-                    "인증 후 자동으로 진행됩니다."
+            elif platform == "instagram":
+                from src.crawlers.instagram_crawler import InstagramCrawler
+                crawler_instance = InstagramCrawler(
+                    headless=use_headless, use_api=True, collect_comments=True
                 )
+            else:  # dcard
+                from src.crawlers.dcard_crawler import DcardCrawler
+                crawler_instance = DcardCrawler(headless=False, use_api=True)
 
-            # 쿠키를 포함하여 크롤링 (auth_mode 전달)
-            result = crawl_with_cookies(platform, url, auth_mode=auth_mode)
-            results.append(result)
+            with crawler_instance as c:
+                # 쿠키 적용 (세션 시작 시 한 번만)
+                if platform == "instagram" and cookies and c.session:
+                    apply_cookies_to_session(c.session, cookies, domain)
+                elif platform == "dcard" and cookies and hasattr(c, 'scraper'):
+                    apply_cookies_to_session(c.scraper, cookies, domain)
 
-            # 결과 표시 - 실제 데이터 수집 여부 확인
-            is_valid = is_crawl_result_valid(result)
-            failure_reason = get_crawl_failure_reason(result) if not is_valid else ""
-
-            if not is_valid:
-                # 에러가 없어도 데이터가 비어있으면 실패 처리
-                if not result.get("error"):
-                    result["error"] = failure_reason or "데이터 수집 실패"
-
-                with result_container:
-                    st.markdown(
-                        f"**{i + 1}. {platform_info['display_name']}** - "
-                        f"실패: {failure_reason or result.get('error', '')[:50]}"
+                for url_idx, url_info in enumerate(url_group):
+                    url = url_info.get("url")
+                    processed_count += 1
+                    progress_bar.progress(processed_count / total)
+                    status_text.markdown(
+                        f"**진행 중:** {processed_count}/{total} - "
+                        f"{platform_info['display_name']} ({url_idx + 1}/{len(url_group)}) - {url[:50]}..."
                     )
-                # 실패 시 플랫폼별 안내
-                if platform == "xiaohongshu":
-                    error_msg = f"**{platform_info['display_name']} - 데이터 수집 실패**\n\n"
-                    if IS_LOCAL and not auth_mode:
-                        error_msg += "**해결 방법:**\n"
-                        error_msg += "1. 사이드바에서 '인증 모드'를 활성화하세요\n"
-                        error_msg += "2. 브라우저 창에서 QR 코드를 스캔하세요\n"
-                        error_msg += "또는 쿠키를 직접 입력해주세요."
+
+                    try:
+                        result = c.crawl_post(url)
+                        results.append(result)
+                        logger.info(f"{platform} 배치 결과: likes={result.get('likes')}, comments={result.get('comments')}")
+
+                        # 결과 표시
+                        is_valid = is_crawl_result_valid(result)
+                        failure_reason = get_crawl_failure_reason(result) if not is_valid else ""
+
+                        if not is_valid:
+                            if not result.get("error"):
+                                result["error"] = failure_reason or "데이터 수집 실패"
+                            with result_container:
+                                st.markdown(
+                                    f"**{processed_count}. {platform_info['display_name']}** - "
+                                    f"실패: {failure_reason or result.get('error', '')[:50]}"
+                                )
+                            # 실패 안내
+                            if platform == "dcard":
+                                error_msg = f"**{platform_info['display_name']} - 데이터 수집 실패**\n\n"
+                                if IS_LOCAL and not auth_mode:
+                                    error_msg += "**해결 방법:**\n"
+                                    error_msg += "1. 사이드바에서 '인증 모드'를 활성화하세요\n"
+                                    error_msg += "2. 브라우저 창에서 Cloudflare 인증을 완료하세요\n"
+                                else:
+                                    error_msg += "Cloudflare 인증이 필요합니다.\n"
+                                    error_msg += "로컬 환경에서 인증 모드를 사용해주세요."
+                                platform_status.error(error_msg)
+                            elif platform in ["instagram", "facebook"]:
+                                platform_status.warning(
+                                    f"**{platform_info['display_name']} - 데이터 수집 실패**\n\n"
+                                    "쿠키가 만료되었을 수 있습니다.\n"
+                                    "사이드바에서 쿠키를 다시 설정해주세요."
+                                )
+                        else:
+                            with result_container:
+                                metrics = []
+                                if result.get("likes", 0) > 0:
+                                    metrics.append(f"좋아요 {result['likes']}")
+                                if result.get("comments", 0) > 0:
+                                    metrics.append(f"댓글 {result['comments']}")
+                                if result.get("views") and result.get("views", 0) > 0:
+                                    metrics.append(f"조회수 {result['views']}")
+                                metrics_str = ", ".join(metrics) if metrics else "데이터 수집됨"
+                                st.markdown(
+                                    f"**{processed_count}. {platform_info['display_name']}** - 성공 ({metrics_str})"
+                                )
+
+                    except Exception as e:
+                        logger.error(f"배치 크롤링 오류 ({platform}, {url}): {e}")
+                        results.append({
+                            "platform": platform, "url": url,
+                            "error": str(e), "crawled_at": datetime.now().isoformat(),
+                        })
+                        with result_container:
+                            st.markdown(
+                                f"**{processed_count}. {platform_info['display_name']}** - 오류: {str(e)[:50]}"
+                            )
+
+                    # 플랫폼별 딜레이
+                    if platform == "dcard":
+                        time.sleep(8)  # Cloudflare 차단 방지
+                    elif platform in ["instagram", "facebook"]:
+                        time.sleep(3)
                     else:
-                        error_msg += "QR 인증이 필요하거나 쿠키가 만료되었을 수 있습니다.\n"
-                        error_msg += "사이드바에서 쿠키를 다시 설정해주세요."
-                    platform_status.error(error_msg)
-                elif platform == "dcard":
-                    error_msg = f"**{platform_info['display_name']} - 데이터 수집 실패**\n\n"
-                    if IS_LOCAL and not auth_mode:
-                        error_msg += "**해결 방법:**\n"
-                        error_msg += "1. 사이드바에서 '인증 모드'를 활성화하세요\n"
-                        error_msg += "2. 브라우저 창에서 Cloudflare 인증을 완료하세요\n"
-                    else:
-                        error_msg += "Cloudflare 인증이 필요합니다.\n"
-                        error_msg += "로컬 환경에서 인증 모드를 사용해주세요."
-                    platform_status.error(error_msg)
-                elif platform in ["instagram", "facebook"]:
-                    platform_status.warning(
-                        f"**{platform_info['display_name']} - 데이터 수집 실패**\n\n"
-                        "쿠키가 만료되었을 수 있습니다.\n"
-                        "사이드바에서 쿠키를 다시 설정해주세요."
-                    )
-            else:
-                with result_container:
-                    # 수집된 데이터 요약 표시
-                    metrics = []
-                    if result.get("likes", 0) > 0:
-                        metrics.append(f"좋아요 {result['likes']}")
-                    if result.get("comments", 0) > 0:
-                        metrics.append(f"댓글 {result['comments']}")
-                    if result.get("views") and result.get("views", 0) > 0:
-                        metrics.append(f"조회수 {result['views']}")
-                    metrics_str = ", ".join(metrics) if metrics else "데이터 수집됨"
-                    st.markdown(
-                        f"**{i + 1}. {platform_info['display_name']}** - 성공 ({metrics_str})"
-                    )
-                # 성공 시 플랫폼 상태 업데이트
-                if platform == "xiaohongshu":
-                    platform_status.success(
-                        f"**{platform_info['display_name']} - 크롤링 성공!**\n\n"
-                        "다음 URL로 진행합니다."
-                    )
+                        time.sleep(1)
 
-            # 플랫폼별 딜레이
-            if platform in ["xiaohongshu", "instagram", "facebook"]:
-                time.sleep(3)
-            else:
-                time.sleep(1)
+            platform_status.success(
+                f"**{platform_info['display_name']} 배치 크롤링 완료!** ({len(url_group)}개 URL)"
+            )
 
         except Exception as e:
-            logger.error(f"크롤링 오류 ({url}): {e}")
-            results.append({
-                "platform": platform,
-                "url": url,
-                "error": str(e),
-                "crawled_at": datetime.now().isoformat(),
-            })
-
-            with result_container:
-                st.markdown(
-                    f"**{i + 1}. {platform_info['display_name']}** - "
-                    f"오류: {str(e)[:50]}"
-                )
+            logger.error(f"{platform} 세션 오류, 개별 크롤링으로 전환: {e}")
+            platform_status.warning(
+                f"**{platform_info['display_name']} - 세션 오류, 개별 크롤링으로 전환**"
+            )
+            # 아직 처리되지 않은 URL들은 개별 크롤링으로 fallback
+            processed_urls = {r.get("url") for r in results}
+            for url_info in url_group:
+                url = url_info.get("url")
+                if url not in processed_urls:
+                    processed_count += 1
+                    progress_bar.progress(processed_count / total)
+                    status_text.markdown(
+                        f"**진행 중 (개별):** {processed_count}/{total} - "
+                        f"{platform_info['display_name']} - {url[:50]}..."
+                    )
+                    try:
+                        result = crawl_with_cookies(platform, url, auth_mode=auth_mode)
+                        results.append(result)
+                    except Exception as fallback_e:
+                        logger.error(f"개별 크롤링도 실패 ({url}): {fallback_e}")
+                        results.append({
+                            "platform": platform, "url": url,
+                            "error": str(fallback_e), "crawled_at": datetime.now().isoformat(),
+                        })
+                    is_valid = is_crawl_result_valid(results[-1])
+                    with result_container:
+                        st.markdown(
+                            f"**{processed_count}. {platform_info['display_name']}** - "
+                            f"{'성공' if is_valid else '실패: ' + results[-1].get('error', '')[:30]}"
+                        )
 
     # 결과 저장
     st.session_state.crawl_results = results
@@ -873,6 +1133,108 @@ def run_crawling():
     st.rerun()
 
 
+def retry_failed_crawls():
+    """실패한 항목만 재수집"""
+    results = st.session_state.get("crawl_results", [])
+
+    # 실패한 항목과 성공한 항목 분리
+    failed_items = []
+    successful_items = []
+
+    for r in results:
+        if is_crawl_result_valid(r):
+            successful_items.append(r)
+        else:
+            failed_items.append(r)
+
+    if not failed_items:
+        st.warning("재수집할 실패 항목이 없습니다.")
+        return
+
+    st.markdown(f"### 실패 항목 재수집 중 ({len(failed_items)}건)")
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    result_container = st.container()
+
+    retry_results = []
+    auth_mode = st.session_state.get("auth_mode", False)
+
+    for i, failed_item in enumerate(failed_items):
+        url = failed_item.get("url")
+        platform = failed_item.get("platform")
+        platform_info = get_platform_crawl_info(platform)
+
+        status_text.markdown(
+            f"**재수집 중:** {i + 1}/{len(failed_items)} - "
+            f"{platform_info['display_name']} - {url[:50]}..."
+        )
+        progress_bar.progress((i + 1) / len(failed_items))
+
+        try:
+            # 쿠키를 포함하여 재크롤링
+            result = crawl_with_cookies(platform, url, auth_mode=auth_mode)
+            retry_results.append(result)
+
+            is_valid = is_crawl_result_valid(result)
+            failure_reason = get_crawl_failure_reason(result) if not is_valid else ""
+
+            with result_container:
+                if is_valid:
+                    metrics = []
+                    if result.get("likes", 0) > 0:
+                        metrics.append(f"좋아요 {result['likes']}")
+                    if result.get("comments", 0) > 0:
+                        metrics.append(f"댓글 {result['comments']}")
+                    metrics_str = ", ".join(metrics) if metrics else "데이터 수집됨"
+                    st.markdown(
+                        f"**{i + 1}. {platform_info['display_name']}** - 재수집 성공 ({metrics_str})"
+                    )
+                else:
+                    st.markdown(
+                        f"**{i + 1}. {platform_info['display_name']}** - "
+                        f"재수집 실패: {failure_reason or '데이터 없음'}"
+                    )
+
+            # 플랫폼별 딜레이
+            if platform in ["xiaohongshu", "instagram", "facebook"]:
+                time.sleep(3)
+            else:
+                time.sleep(1)
+
+        except Exception as e:
+            logger.error(f"재수집 오류 ({url}): {e}")
+            retry_results.append({
+                "platform": platform,
+                "url": url,
+                "error": str(e),
+                "crawled_at": datetime.now().isoformat(),
+            })
+            with result_container:
+                st.markdown(
+                    f"**{i + 1}. {platform_info['display_name']}** - "
+                    f"오류: {str(e)[:50]}"
+                )
+
+    # 기존 성공 항목 + 재수집 결과로 업데이트
+    st.session_state.crawl_results = successful_items + retry_results
+
+    progress_bar.progress(1.0)
+    status_text.markdown("**재수집 완료!**")
+
+    # 재수집 결과 요약
+    retry_success = sum(1 for r in retry_results if is_crawl_result_valid(r))
+    retry_fail = len(retry_results) - retry_success
+
+    if retry_fail == 0:
+        st.success(f"재수집 완료! {retry_success}건 모두 성공")
+    else:
+        st.warning(f"재수집 완료. 성공: {retry_success}건, 실패: {retry_fail}건")
+
+    time.sleep(1)
+    st.rerun()
+
+
 def render_results():
     """크롤링 결과 표시"""
     results = st.session_state.get("crawl_results", [])
@@ -881,6 +1243,22 @@ def render_results():
         return
 
     st.markdown("### 크롤링 결과")
+
+    # 실패한 항목 확인
+    failed_items = [r for r in results if not is_crawl_result_valid(r)]
+
+    # 재수집 버튼 (실패 항목이 있는 경우에만 표시)
+    if failed_items:
+        col1, col2, col3 = st.columns([2, 2, 2])
+        with col2:
+            if st.button(
+                f"실패 항목 재수집 ({len(failed_items)}건)",
+                key="retry_failed",
+                use_container_width=True,
+                type="secondary",
+            ):
+                retry_failed_crawls()
+                return
 
     # 결과 집계
     aggregated = aggregate_results(results)
@@ -926,6 +1304,20 @@ def render_results():
     st.markdown("#### 상세 결과")
 
     df = export_to_dataframe(results)
+
+    # 조회수 표시 - 실제 데이터 유무 기반 (v1.5.8)
+    def format_views_display(row):
+        """조회수 표시 (데이터 유무로 판단: None/NaN=수집불가, 0=-, 숫자=포맷팅)"""
+        views = row.get("views")
+        if views is None or pd.isna(views):
+            return "수집 불가"
+        views = int(views)
+        if views == 0:
+            return "-"
+        return format_number(views)
+
+    # views 컬럼을 문자열로 변환
+    df["views"] = df.apply(format_views_display, axis=1)
 
     # 컬럼명 한글화
     column_rename = {

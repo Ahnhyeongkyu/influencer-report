@@ -20,6 +20,15 @@ PLATFORM_METRICS = {
     "dcard": ["likes", "comments"],
 }
 
+# 조회수 수집 가능 플랫폼 (True = 수집 가능, False = 수집 불가)
+PLATFORM_VIEW_SUPPORT = {
+    "youtube": True,       # YouTube는 조회수 공개
+    "instagram": False,    # Instagram 일반 게시물은 조회수 비공개 (릴스만 제공)
+    "facebook": False,     # Facebook 공개 페이지도 조회수 비공개
+    "xiaohongshu": False,  # 샤오홍슈 조회수 비공개
+    "dcard": False,        # Dcard 조회수 비공개
+}
+
 # 지표 표시명 (한국어)
 METRIC_DISPLAY_NAMES = {
     "likes": "좋아요",
@@ -246,10 +255,13 @@ def export_to_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
 
     df = pd.DataFrame(rows, columns=columns)
 
-    # 타입 변환
-    numeric_cols = ["likes", "comments", "shares", "views", "favorites"]
+    # 타입 변환 (int64 사용 - 50억+ 조회수 지원)
+    # views는 None 보존 (수집 불가 구분용 - v1.5.8)
+    numeric_cols = ["likes", "comments", "shares", "favorites"]
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype('int64')
+    # views: None → NaN 유지 (데이터 유무로 "수집 불가" 판단)
+    df["views"] = pd.to_numeric(df["views"], errors="coerce")
 
     return df
 
@@ -277,6 +289,13 @@ def generate_summary_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
         total_views = sum(safe_int(r.get("views")) for r in success_results)
         total_favorites = sum(safe_int(r.get("favorites")) for r in success_results)
 
+        # 조회수 표시 (실제 데이터 유무로 판단 - v1.5.8)
+        has_views_data = any(r.get("views") is not None for r in success_results)
+        if has_views_data:
+            views_display = total_views if total_views > 0 else "-"
+        else:
+            views_display = "수집 불가"
+
         rows.append({
             "플랫폼": get_platform_display_name(platform),
             "게시물 수": len(platform_results),
@@ -285,7 +304,7 @@ def generate_summary_table(results: List[Dict[str, Any]]) -> pd.DataFrame:
             "총 좋아요": total_likes,
             "총 댓글": total_comments,
             "총 공유": total_shares,
-            "총 조회수": total_views if total_views > 0 else "-",
+            "총 조회수": views_display,
             "총 즐겨찾기": total_favorites if total_favorites > 0 else "-",
         })
 

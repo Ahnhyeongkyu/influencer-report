@@ -15,6 +15,87 @@ from jinja2 import Environment, FileSystemLoader
 
 logger = logging.getLogger(__name__)
 
+
+def fetch_thumbnail_image(url: str, max_size: tuple = (80, 80), timeout: int = 5):
+    """
+    URL에서 썸네일 이미지를 가져와 ReportLab Image 객체로 변환
+
+    Args:
+        url: 이미지 URL
+        max_size: 최대 크기 (width, height) in mm
+        timeout: 요청 타임아웃 (초)
+
+    Returns:
+        ReportLab Image 객체 또는 None
+    """
+    if not url:
+        return None
+
+    try:
+        import requests
+        from reportlab.platypus import Image
+        from reportlab.lib.units import mm
+        from PIL import Image as PILImage
+
+        # 이미지 다운로드
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        response.raise_for_status()
+
+        # PIL로 이미지 로드 및 크기 조정
+        img_data = io.BytesIO(response.content)
+        pil_img = PILImage.open(img_data)
+
+        # RGB로 변환 (RGBA나 P 모드 처리)
+        if pil_img.mode in ('RGBA', 'P'):
+            pil_img = pil_img.convert('RGB')
+
+        # 크기 조정 (비율 유지, 고해상도 유지)
+        max_w, max_h = max_size
+        orig_w, orig_h = pil_img.size
+
+        # PDF 출력 해상도 기준 (150 DPI)
+        dpi = 150
+        target_w = int(max_w / 25.4 * dpi)  # mm to pixels at 150 DPI
+        target_h = int(max_h / 25.4 * dpi)
+
+        # 비율 유지하면서 리사이즈
+        ratio = min(target_w / orig_w, target_h / orig_h)
+        new_w = int(orig_w * ratio)
+        new_h = int(orig_h * ratio)
+
+        # 원본보다 작을 때만 리사이즈 (확대는 하지 않음)
+        if new_w < orig_w or new_h < orig_h:
+            pil_img = pil_img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+
+        # BytesIO로 변환
+        output = io.BytesIO()
+        pil_img.save(output, format='JPEG', quality=90)
+        output.seek(0)
+
+        # ReportLab Image 생성 (비율 유지)
+        img_w, img_h = pil_img.size
+        aspect_ratio = img_w / img_h
+
+        # max 크기 내에서 비율 유지
+        if aspect_ratio > (max_w / max_h):
+            # 가로가 더 넓음
+            final_w = max_w * mm
+            final_h = (max_w / aspect_ratio) * mm
+        else:
+            # 세로가 더 높음
+            final_h = max_h * mm
+            final_w = (max_h * aspect_ratio) * mm
+
+        img = Image(output, width=final_w, height=final_h)
+        return img
+
+    except Exception as e:
+        logger.debug(f"썸네일 로딩 실패 ({url[:50]}...): {e}")
+        return None
+
 # 플랫폼 한글명
 PLATFORM_NAMES_KR = {
     "xiaohongshu": "샤오홍슈",
@@ -23,6 +104,13 @@ PLATFORM_NAMES_KR = {
     "facebook": "페이스북",
     "dcard": "디카드",
 }
+
+# 조회수 수집 가능 플랫폼 (참고용 - 실제 표시는 데이터 유무로 판단)
+# YouTube: 항상 조회수 공개
+# Instagram: 릴스/영상만 조회수 제공, 일반 이미지는 없음
+# Facebook: 동영상만 조회수 제공, 이미지/텍스트는 없음
+# Xiaohongshu: 일부 게시물만 조회수 제공
+# Dcard: 조회수 비공개
 
 
 def format_number(num: Optional[int]) -> str:
@@ -53,6 +141,29 @@ def format_number(num: Optional[int]) -> str:
         return str(num)
 
 
+def format_metric(value: Any) -> str:
+    """
+    지표 표시 (실제 데이터 유무로 판단)
+    - None → 수집 불가 (해당 플랫폼/게시물에서 제공 안 함)
+    - 0 → -
+    - 숫자 → 포맷팅
+
+    Args:
+        value: 지표 값
+
+    Returns:
+        포맷된 문자열
+    """
+    if value is None:
+        return "수집 불가"
+    return format_number(value)
+
+
+def format_views_for_platform(views: Optional[int], platform: str) -> str:
+    """조회수 표시 (하위 호환용)"""
+    return format_metric(views)
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     """
     안전하게 정수로 변환
@@ -70,6 +181,34 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (ValueError, TypeError):
         return default
+
+
+def wrap_cjk_font(text: str, cjk_font: str = 'MSYaHei') -> str:
+    """
+    텍스트 내 중국어/일본어 문자를 감지하여 CJK 폰트 태그로 감싸기
+    (ReportLab Paragraph 인라인 폰트 변경용)
+    """
+    if not text:
+        return text
+    # XML 특수문자 이스케이프 (ReportLab Paragraph는 XML 파서 사용)
+    # 순서 중요: & 먼저, 그 다음 < > (이미 변환된 &amp;의 재변환 방지)
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    import re
+    # 중국어 간체/번체 + 일본어 범위 (한국어 제외)
+    # CJK Unified Ideographs, CJK Ext-A, CJK Compatibility
+    cjk_pattern = re.compile(r'([\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u2e80-\u2eff\u3000-\u303f\u31c0-\u31ef]+)')
+    parts = cjk_pattern.split(text)
+    if len(parts) == 1:
+        return text  # CJK 문자 없음
+    result = []
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        if cjk_pattern.match(part):
+            result.append(f'<font name="{cjk_font}">{part}</font>')
+        else:
+            result.append(part)
+    return ''.join(result)
 
 
 def shorten_url(url: str, max_length: int = 50) -> str:
@@ -275,18 +414,42 @@ class PDFReportGenerator:
         posts = []
         for result in results:
             platform = result.get("platform", "unknown")
+            likes = safe_int(result.get("likes"))
+            comments = safe_int(result.get("comments"))
+            # comments가 0이고 comments_list가 있으면 그 길이 사용
+            if comments == 0 and result.get("comments_list"):
+                comments = len(result.get("comments_list"))
+            shares = safe_int(result.get("shares"))
+            favorites = safe_int(result.get("favorites"))
+            engagement = likes + comments + shares + favorites
+
+            # title 추출 (title > content > description > caption > url)
+            title = result.get("title") or result.get("content") or result.get("description") or result.get("caption") or ""
+            if title:
+                title = title[:80] + "..." if len(title) > 80 else title
+            else:
+                title = shorten_url(result.get("url", ""), 40)
+
             posts.append({
                 "platform": platform,
                 "platform_name": PLATFORM_NAMES_KR.get(platform, platform),
                 "author": result.get("author", "-"),
+                "title": title,
                 "url": result.get("url", ""),
                 "url_short": shorten_url(result.get("url", ""), 45),
-                "views_formatted": format_number(safe_int(result.get("views"))),
-                "likes_formatted": format_number(safe_int(result.get("likes"))),
-                "comments_formatted": format_number(safe_int(result.get("comments"))),
-                "shares_formatted": format_number(safe_int(result.get("shares"))),
+                "views_formatted": format_metric(result.get("views")),  # 데이터 유무 기반 표시
+                "likes_formatted": format_metric(result.get("likes")),
+                "comments_formatted": format_number(comments),
+                "shares_formatted": format_metric(result.get("shares")),
+                "engagement": engagement,
+                "engagement_formatted": format_number(engagement),
                 "error": result.get("error"),
+                "thumbnail": result.get("thumbnail"),
             })
+
+        # 상위 게시물 (인게이지먼트 기준 정렬)
+        success_posts = [p for p in posts if not p.get("error")]
+        top_posts = sorted(success_posts, key=lambda x: x["engagement"], reverse=True)[:4]
 
         return {
             "campaign_name": campaign_name or "캠페인",
@@ -312,6 +475,9 @@ class PDFReportGenerator:
 
             # 개별 게시물
             "posts": posts,
+
+            # 상위 게시물 (Best 콘텐츠)
+            "top_posts": top_posts,
 
             # 차트
             "charts": charts,
@@ -451,7 +617,7 @@ class PDFReportGenerator:
         output_path: Optional[str] = None
     ) -> bytes:
         """
-        ReportLab을 사용한 PDF 생성 (전문 보고서 형식)
+        ReportLab을 사용한 PDF 생성 (문서1.jpg 스타일 - 깔끔한 대시보드 형식)
 
         Args:
             campaign_name: 캠페인명
@@ -480,21 +646,31 @@ class PDFReportGenerator:
         from reportlab.graphics.charts.barcharts import HorizontalBarChart
         from reportlab.graphics import renderPDF
 
-        # 브랜드 컬러 정의
-        BRAND_PRIMARY = colors.HexColor('#1a365d')      # 네이비 블루
-        BRAND_SECONDARY = colors.HexColor('#2d3748')    # 다크 그레이
-        BRAND_ACCENT = colors.HexColor('#3182ce')       # 밝은 블루
-        BRAND_SUCCESS = colors.HexColor('#38a169')      # 그린
-        BRAND_WARNING = colors.HexColor('#d69e2e')      # 옐로우
+        # 브랜드 컬러 정의 (문서1.jpg 스타일 - 보라/회색 계열)
+        BRAND_PRIMARY = colors.HexColor('#6b46c1')      # 보라색 (메인)
+        BRAND_SECONDARY = colors.HexColor('#4a5568')    # 다크 그레이
+        BRAND_ACCENT = colors.HexColor('#805ad5')       # 밝은 보라
+        BRAND_SUCCESS = colors.HexColor('#48bb78')      # 그린
+        BRAND_WARNING = colors.HexColor('#ed8936')      # 오렌지
         BRAND_LIGHT = colors.HexColor('#f7fafc')        # 라이트 그레이
         BRAND_BORDER = colors.HexColor('#e2e8f0')       # 보더 컬러
+        CARD_BG = colors.HexColor('#faf5ff')            # 연한 보라 배경
 
         # 한글 폰트 등록
         font_name = 'Helvetica'
         font_name_bold = 'Helvetica-Bold'
         try:
+            # Microsoft YaHei: 한국어+중국어+일본어 모두 지원
+            yh_path = "C:/Windows/Fonts/msyh.ttc"
+            yh_bold_path = "C:/Windows/Fonts/msyhbd.ttc"
             font_path = "C:/Windows/Fonts/malgun.ttf"
             font_path_bold = "C:/Windows/Fonts/malgunbd.ttf"
+
+            # Malgun Gothic (한국어 기본) + YaHei fallback 등록
+            if os.path.exists(yh_path):
+                pdfmetrics.registerFont(TTFont('MSYaHei', yh_path, subfontIndex=0))
+                if os.path.exists(yh_bold_path):
+                    pdfmetrics.registerFont(TTFont('MSYaHeiBold', yh_bold_path, subfontIndex=0))
             if os.path.exists(font_path):
                 pdfmetrics.registerFont(TTFont('MalgunGothic', font_path))
                 font_name = 'MalgunGothic'
@@ -516,44 +692,19 @@ class PDFReportGenerator:
         grouped = self._group_by_platform(results)
         platform_stats = self._calculate_platform_stats(grouped)
 
-        # 페이지 헤더/푸터 함수
-        page_number = [0]  # 페이지 번호 추적용
+        # 페이지 헤더/푸터 함수 (문서1.jpg 스타일 - 간소화)
+        page_number = [0]
 
-        def add_page_header_footer(canvas, doc):
-            """페이지 헤더와 푸터 추가"""
+        def add_page_footer(canvas, doc):
+            """간소화된 페이지 푸터"""
             page_number[0] += 1
             canvas.saveState()
-
-            # 첫 페이지(표지)는 헤더/푸터 없음
-            if page_number[0] == 1:
-                canvas.restoreState()
-                return
-
             page_width, page_height = A4
 
-            # 헤더 - 상단 라인과 캠페인명
-            canvas.setStrokeColor(BRAND_PRIMARY)
-            canvas.setLineWidth(2)
-            canvas.line(15*mm, page_height - 12*mm, page_width - 15*mm, page_height - 12*mm)
-
+            # 페이지 번호만 표시 (하단 중앙)
             canvas.setFont(font_name, 8)
-            canvas.setFillColor(BRAND_SECONDARY)
-            canvas.drawString(15*mm, page_height - 10*mm, f"{campaign_name} - 캠페인 성과 리포트")
-
-            # 푸터 - 하단 라인, 페이지 번호, 생성일
-            canvas.setStrokeColor(BRAND_BORDER)
-            canvas.setLineWidth(0.5)
-            canvas.line(15*mm, 15*mm, page_width - 15*mm, 15*mm)
-
-            canvas.setFont(font_name, 8)
-            canvas.setFillColor(BRAND_SECONDARY)
-            # 왼쪽: 생성일
-            canvas.drawString(15*mm, 10*mm, f"생성일: {datetime.now().strftime('%Y-%m-%d')}")
-            # 가운데: 페이지 번호
-            page_text = f"- {page_number[0] - 1} -"  # 표지 제외한 페이지 번호
-            canvas.drawCentredString(page_width / 2, 10*mm, page_text)
-            # 오른쪽: 기밀 표시
-            canvas.drawRightString(page_width - 15*mm, 10*mm, "Confidential")
+            canvas.setFillColor(colors.HexColor('#a0aec0'))
+            canvas.drawCentredString(page_width / 2, 10*mm, f"{page_number[0]}")
 
             canvas.restoreState()
 
@@ -672,151 +823,34 @@ class PDFReportGenerator:
             textColor=BRAND_SECONDARY
         ))
 
-        # 컨텐츠 빌드
+        # 컨텐츠 빌드 (문서1.jpg 스타일 - 대시보드 형식)
         story = []
 
-        # ============================================================
-        # 1. 표지 페이지
-        # ============================================================
-        story.append(Spacer(1, 30*mm))
+        # 성공한 결과만 필터
+        success_results = [r for r in results if "error" not in r]
 
-        # 로고 영역 (플레이스홀더 박스)
-        logo_table = Table(
-            [[Paragraph("LOGO", styles['CoverInfo'])]],
-            colWidths=[50*mm],
-            rowHeights=[20*mm]
+        # ============================================================
+        # 1. 누적성과 섹션 (메인 페이지)
+        # ============================================================
+        # 헤더: 누적성과 제목 + 기준일
+        header_data = [[
+            Paragraph("<b>누적성과</b>", ParagraphStyle(name='HeaderTitle', fontName=font_name_bold, fontSize=14, textColor=BRAND_SECONDARY)),
+            Paragraph(f"기준일: {end_date}", ParagraphStyle(name='HeaderDate', fontName=font_name, fontSize=9, textColor=colors.HexColor('#718096'), alignment=TA_RIGHT))
+        ]]
+        header_table = Table(header_data, colWidths=[90*mm, 90*mm])
+        header_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        story.append(header_table)
+
+        # 캠페인 정보 서브헤더
+        sub_header = Paragraph(
+            f"{campaign_name} | {advertiser_name} | {start_date} ~ {end_date}",
+            ParagraphStyle(name='SubHeader', fontName=font_name, fontSize=9, textColor=colors.HexColor('#718096'))
         )
-        logo_table.setStyle(TableStyle([
-            ('BOX', (0, 0), (-1, -1), 1, BRAND_BORDER),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('BACKGROUND', (0, 0), (-1, -1), BRAND_LIGHT),
-        ]))
-        logo_wrapper = Table([[logo_table]], colWidths=[180*mm])
-        logo_wrapper.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ]))
-        story.append(logo_wrapper)
-
-        story.append(Spacer(1, 20*mm))
-
-        # 상단 장식선
-        story.append(HRFlowable(
-            width="80%",
-            thickness=3,
-            color=BRAND_PRIMARY,
-            spaceBefore=5*mm,
-            spaceAfter=10*mm,
-            hAlign='CENTER'
-        ))
-
-        # 리포트 타이틀
-        story.append(Paragraph("캠페인 성과 리포트", styles['CoverTitle']))
-        story.append(Paragraph("Campaign Performance Report", styles['CoverInfo']))
-
-        story.append(Spacer(1, 10*mm))
-
-        # 캠페인명
-        story.append(Paragraph(f'"{campaign_name}"', styles['CoverSubtitle']))
-
-        # 하단 장식선
-        story.append(HRFlowable(
-            width="80%",
-            thickness=3,
-            color=BRAND_PRIMARY,
-            spaceBefore=10*mm,
-            spaceAfter=15*mm,
-            hAlign='CENTER'
-        ))
-
-        # 표지 정보 테이블
-        cover_info_data = [
-            ["광고주", advertiser_name],
-            ["분석 기간", f"{start_date} ~ {end_date}"],
-            ["리포트 생성일", datetime.now().strftime('%Y년 %m월 %d일')],
-            ["총 분석 게시물", f"{aggregated['total_posts']}개"],
-        ]
-        cover_info_table = Table(cover_info_data, colWidths=[45*mm, 80*mm])
-        cover_info_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, -1), font_name),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('TEXTCOLOR', (0, 0), (0, -1), BRAND_SECONDARY),
-            ('TEXTCOLOR', (1, 0), (1, -1), BRAND_PRIMARY),
-            ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('RIGHTPADDING', (0, 0), (0, -1), 10),
-            ('LEFTPADDING', (1, 0), (1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ]))
-        cover_wrapper = Table([[cover_info_table]], colWidths=[180*mm])
-        cover_wrapper.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ]))
-        story.append(cover_wrapper)
-
-        story.append(Spacer(1, 30*mm))
-
-        # 기밀 표시
-        story.append(Paragraph(
-            "본 리포트는 광고주를 위해 작성된 기밀 문서입니다.",
-            styles['Caption']
-        ))
-
-        story.append(PageBreak())
-
-        # ============================================================
-        # 2. 목차 페이지
-        # ============================================================
-        story.append(Paragraph("목 차", styles['SectionHeading']))
-        story.append(HRFlowable(
-            width="100%",
-            thickness=1,
-            color=BRAND_BORDER,
-            spaceAfter=5*mm
-        ))
-
-        toc_items = [
-            ("1. Executive Summary", "핵심 성과 요약"),
-            ("2. 캠페인 성과 개요", "주요 지표 및 통계"),
-            ("3. 플랫폼별 성과 분석", "채널별 상세 분석"),
-            ("4. 개별 게시물 상세", "게시물 리스트"),
-            ("5. 결론 및 제언", "인사이트 요약"),
-        ]
-
-        for section, desc in toc_items:
-            toc_entry = Table(
-                [[Paragraph(section, styles['TOCEntry']),
-                  Paragraph(desc, styles['Caption'])]],
-                colWidths=[80*mm, 80*mm]
-            )
-            toc_entry.setStyle(TableStyle([
-                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ]))
-            story.append(toc_entry)
-            story.append(HRFlowable(
-                width="100%",
-                thickness=0.3,
-                color=BRAND_BORDER,
-                spaceAfter=2*mm
-            ))
-
-        story.append(PageBreak())
-
-        # ============================================================
-        # 3. Executive Summary
-        # ============================================================
-        story.append(Paragraph("1. Executive Summary", styles['SectionHeading']))
-        story.append(HRFlowable(
-            width="100%",
-            thickness=2,
-            color=BRAND_PRIMARY,
-            spaceAfter=8*mm
-        ))
+        story.append(sub_header)
+        story.append(Spacer(1, 5*mm))
 
         # 핵심 인사이트 문구 생성
         total_posts = aggregated['total_posts']
@@ -825,351 +859,218 @@ class PDFReportGenerator:
         avg_engagement = aggregated['avg_engagement']
         platform_count = len(platform_stats)
 
-        # 최고 성과 플랫폼 찾기
-        best_platform = None
-        best_engagement = 0
-        for platform, stats in platform_stats.items():
-            if stats['engagement'] > best_engagement:
-                best_engagement = stats['engagement']
-                best_platform = platform
+        # 평균 계산
+        avg_views = total_views / total_posts if total_posts > 0 else 0
+        avg_engagement_per_post = total_engagement / total_posts if total_posts > 0 else 0
 
-        best_platform_name = PLATFORM_NAMES_KR.get(best_platform, best_platform) if best_platform else "-"
+        # ============================================================
+        # 누적성과 4개 카드 (계약 범위 내 데이터로 구성)
+        # ============================================================
+        total_likes = aggregated['total_likes']
+        avg_likes = total_likes / total_posts if total_posts > 0 else 0
 
-        # 인사이트 박스
-        insight_text = f"""
-        <b>핵심 인사이트</b><br/><br/>
-        본 캠페인은 총 <b>{total_posts}개</b>의 게시물을 통해 <b>{format_number(total_engagement)}건</b>의
-        인게이지먼트를 달성하였습니다. {platform_count}개 플랫폼에서 진행되었으며,
-        게시물당 평균 <b>{format_number(int(avg_engagement))}건</b>의 반응을 이끌어냈습니다.
-        {f'특히 <b>{best_platform_name}</b> 채널에서 가장 높은 성과를 기록하였습니다.' if best_platform else ''}
-        """
-
-        insight_table = Table(
-            [[Paragraph(insight_text, styles['BodyText'])]],
-            colWidths=[165*mm]
-        )
-        insight_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#ebf8ff')),
-            ('BOX', (0, 0), (-1, -1), 2, BRAND_ACCENT),
-            ('LEFTPADDING', (0, 0), (-1, -1), 15),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 15),
-            ('TOPPADDING', (0, 0), (-1, -1), 15),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 15),
-        ]))
-        story.append(insight_table)
-        story.append(Spacer(1, 8*mm))
-
-        # 핵심 지표 카드 (4개)
         metric_cards_data = [
             [
-                self._create_metric_card("총 게시물", f"{total_posts}개", BRAND_PRIMARY, font_name, font_name_bold),
-                self._create_metric_card("총 조회수", format_number(total_views), BRAND_ACCENT, font_name, font_name_bold),
-                self._create_metric_card("총 인게이지먼트", format_number(total_engagement), BRAND_SUCCESS, font_name, font_name_bold),
-                self._create_metric_card("평균 반응", format_number(int(avg_engagement)), BRAND_WARNING, font_name, font_name_bold),
+                self._create_metric_card_simple("콘텐츠수", f"{total_posts}개", BRAND_PRIMARY, font_name, font_name_bold, CARD_BG),
+                self._create_metric_card_v2("총 조회수", format_number(total_views), format_number(int(avg_views)), BRAND_ACCENT, font_name, font_name_bold),
+                self._create_metric_card_v2("총 인게이지먼트", format_number(total_engagement), format_number(int(avg_engagement_per_post)), BRAND_SUCCESS, font_name, font_name_bold),
+                self._create_metric_card_v2("총 좋아요", format_number(total_likes), format_number(int(avg_likes)), BRAND_WARNING, font_name, font_name_bold),
             ]
         ]
 
-        metric_cards_table = Table(metric_cards_data, colWidths=[42*mm, 42*mm, 42*mm, 42*mm])
+        metric_cards_table = Table(metric_cards_data, colWidths=[45*mm, 45*mm, 45*mm, 45*mm])
         metric_cards_table.setStyle(TableStyle([
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ]))
         story.append(metric_cards_table)
-
-        story.append(PageBreak())
+        story.append(Spacer(1, 8*mm))
 
         # ============================================================
-        # 4. 캠페인 성과 개요
+        # Best 콘텐츠 섹션 (문서1.jpg 스타일 - 인게이지먼트 상위 4개)
         # ============================================================
-        story.append(Paragraph("2. 캠페인 성과 개요", styles['SectionHeading']))
-        story.append(HRFlowable(
-            width="100%",
-            thickness=2,
-            color=BRAND_PRIMARY,
-            spaceAfter=8*mm
-        ))
-
-        story.append(Paragraph("2.1 주요 성과 지표", styles['SubHeading']))
-
-        # 성과 요약 테이블 (개선된 디자인)
-        summary_data = [
-            ["구분", "지표명", "값", "비고"],
-            ["수집", "총 게시물 수", str(aggregated["total_posts"]), f"성공 {aggregated['success_count']}건"],
-            ["도달", "총 조회수", format_number(aggregated["total_views"]), "전체 플랫폼 합계"],
-            ["반응", "좋아요", format_number(aggregated["total_likes"]), ""],
-            ["반응", "댓글", format_number(aggregated["total_comments"]), ""],
-            ["반응", "공유", format_number(aggregated["total_shares"]), ""],
-            ["반응", "저장/즐겨찾기", format_number(aggregated["total_favorites"]), ""],
-            ["종합", "총 인게이지먼트", format_number(aggregated["total_engagement"]), "좋아요+댓글+공유+저장"],
-            ["효율", "게시물당 평균 반응", format_number(int(aggregated["avg_engagement"])), ""],
-        ]
-
-        summary_table = Table(summary_data, colWidths=[25*mm, 50*mm, 40*mm, 50*mm])
-        summary_table.setStyle(TableStyle([
-            # 헤더 스타일
-            ('BACKGROUND', (0, 0), (-1, 0), BRAND_PRIMARY),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), font_name_bold),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
-
-            # 본문 스타일
-            ('FONTNAME', (0, 1), (-1, -1), font_name),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-            ('ALIGN', (0, 1), (0, -1), 'CENTER'),
-            ('ALIGN', (2, 1), (2, -1), 'RIGHT'),
-            ('ALIGN', (3, 1), (3, -1), 'LEFT'),
-
-            # 구분 컬럼 배경색
-            ('BACKGROUND', (0, 1), (0, 2), colors.HexColor('#e6f2ff')),  # 수집/도달 - 파랑
-            ('BACKGROUND', (0, 3), (0, 6), colors.HexColor('#e6ffe6')),  # 반응 - 초록
-            ('BACKGROUND', (0, 7), (0, 7), colors.HexColor('#fff2e6')),  # 종합 - 주황
-            ('BACKGROUND', (0, 8), (0, 8), colors.HexColor('#f0e6ff')),  # 효율 - 보라
-
-            # 그리드
-            ('GRID', (0, 0), (-1, -1), 0.5, BRAND_BORDER),
-            ('LINEBELOW', (0, 0), (-1, 0), 2, BRAND_PRIMARY),
-
-            # 행 배경색
-            ('ROWBACKGROUNDS', (1, 1), (-1, -1), [colors.white, BRAND_LIGHT]),
-
-            # 패딩
-            ('LEFTPADDING', (0, 0), (-1, -1), 8),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-
-            # 종합 행 강조
-            ('BACKGROUND', (1, 7), (-1, 7), colors.HexColor('#fff8e6')),
-            ('FONTNAME', (1, 7), (-1, 7), font_name_bold),
+        # Best 콘텐츠 헤더
+        best_header_data = [[
+            Paragraph("<b>Best 콘텐츠</b>", ParagraphStyle(name='BestHeader', fontName=font_name_bold, fontSize=12, textColor=BRAND_SECONDARY)),
+            Paragraph("인게이지먼트순", ParagraphStyle(name='BestSort', fontName=font_name, fontSize=9, textColor=colors.HexColor('#718096'), alignment=TA_RIGHT))
+        ]]
+        best_header_table = Table(best_header_data, colWidths=[90*mm, 90*mm])
+        best_header_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
         ]))
-        story.append(summary_table)
-
-        # 수집 결과 요약
-        if aggregated['error_count'] > 0:
-            story.append(Spacer(1, 3*mm))
-            story.append(Paragraph(
-                f"* {aggregated['error_count']}건의 게시물은 데이터 수집에 실패하였습니다.",
-                styles['Caption']
-            ))
-
-        story.append(PageBreak())
-
-        # ============================================================
-        # 5. 플랫폼별 성과 분석
-        # ============================================================
-        story.append(Paragraph("3. 플랫폼별 성과 분석", styles['SectionHeading']))
-        story.append(HRFlowable(
-            width="100%",
-            thickness=2,
-            color=BRAND_PRIMARY,
-            spaceAfter=8*mm
-        ))
-
-        story.append(Paragraph("3.1 플랫폼별 상세 성과", styles['SubHeading']))
-
-        # 플랫폼 컬러 맵
-        platform_colors = {
-            'youtube': colors.HexColor('#FF0000'),
-            'instagram': colors.HexColor('#E4405F'),
-            'facebook': colors.HexColor('#1877F2'),
-            'xiaohongshu': colors.HexColor('#FF2442'),
-            'dcard': colors.HexColor('#006aa6'),
-        }
-
-        # 플랫폼별 카드 형식
-        for platform, stats in platform_stats.items():
-            platform_name = PLATFORM_NAMES_KR.get(platform, platform)
-            platform_color = platform_colors.get(platform, BRAND_ACCENT)
-
-            # 플랫폼 헤더
-            platform_header = Table(
-                [[Paragraph(f"<b>{platform_name}</b>", styles['BodyText'])]],
-                colWidths=[165*mm]
-            )
-            platform_header.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, -1), platform_color),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.white),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 10),
-                ('TOPPADDING', (0, 0), (-1, -1), 8),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ]))
-            story.append(platform_header)
-
-            # 플랫폼 상세 데이터
-            platform_detail_data = [
-                ["게시물 수", "조회수", "좋아요", "댓글", "공유", "저장", "총 인게이지먼트"],
-                [
-                    str(stats["count"]),
-                    format_number(stats["views"]),
-                    format_number(stats["likes"]),
-                    format_number(stats["comments"]),
-                    format_number(stats["shares"]),
-                    format_number(stats["favorites"]),
-                    format_number(stats["engagement"]),
-                ],
-            ]
-
-            platform_detail_table = Table(
-                platform_detail_data,
-                colWidths=[23*mm, 24*mm, 24*mm, 24*mm, 24*mm, 24*mm, 30*mm]
-            )
-            platform_detail_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), font_name),
-                ('FONTSIZE', (0, 0), (-1, 0), 8),
-                ('FONTSIZE', (0, 1), (-1, 1), 10),
-                ('FONTNAME', (0, 1), (-1, 1), font_name_bold),
-                ('TEXTCOLOR', (0, 0), (-1, 0), BRAND_SECONDARY),
-                ('TEXTCOLOR', (0, 1), (-1, 1), BRAND_PRIMARY),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('BACKGROUND', (0, 0), (-1, -1), BRAND_LIGHT),
-                ('BOX', (0, 0), (-1, -1), 1, BRAND_BORDER),
-                ('LINEBELOW', (0, 0), (-1, 0), 0.5, BRAND_BORDER),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                # 총 인게이지먼트 강조
-                ('BACKGROUND', (-1, 0), (-1, -1), colors.HexColor('#ebf8ff')),
-            ]))
-            story.append(platform_detail_table)
-            story.append(Spacer(1, 5*mm))
-
-        # 플랫폼 비교 요약
-        story.append(Paragraph("3.2 플랫폼 성과 비교", styles['SubHeading']))
-
-        platform_compare_data = [["플랫폼", "게시물", "조회수", "좋아요", "댓글", "공유", "인게이지먼트"]]
-
-        # 가장 높은 인게이지먼트 플랫폼 찾기
-        max_engagement_platform = max(platform_stats.items(), key=lambda x: x[1]['engagement'])[0] if platform_stats else None
-
-        for platform, stats in platform_stats.items():
-            platform_compare_data.append([
-                PLATFORM_NAMES_KR.get(platform, platform),
-                str(stats["count"]),
-                format_number(stats["views"]),
-                format_number(stats["likes"]),
-                format_number(stats["comments"]),
-                format_number(stats["shares"]),
-                format_number(stats["engagement"]),
-            ])
-
-        platform_compare_table = Table(
-            platform_compare_data,
-            colWidths=[30*mm, 20*mm, 25*mm, 25*mm, 25*mm, 22*mm, 28*mm]
-        )
-
-        # 테이블 스타일
-        table_style_commands = [
-            ('BACKGROUND', (0, 0), (-1, 0), BRAND_PRIMARY),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), font_name_bold),
-            ('FONTNAME', (0, 1), (-1, -1), font_name),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-            ('GRID', (0, 0), (-1, -1), 0.5, BRAND_BORDER),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, BRAND_LIGHT]),
-            ('TOPPADDING', (0, 0), (-1, -1), 6),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('LEFTPADDING', (0, 0), (-1, -1), 6),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
-        ]
-
-        # 최고 성과 플랫폼 행 강조
-        if max_engagement_platform:
-            for i, (platform, _) in enumerate(platform_stats.items(), 1):
-                if platform == max_engagement_platform:
-                    table_style_commands.append(('BACKGROUND', (0, i), (-1, i), colors.HexColor('#e6ffe6')))
-                    table_style_commands.append(('FONTNAME', (0, i), (-1, i), font_name_bold))
-
-        platform_compare_table.setStyle(TableStyle(table_style_commands))
-        story.append(platform_compare_table)
-
-        if max_engagement_platform:
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph(
-                f"* {PLATFORM_NAMES_KR.get(max_engagement_platform, max_engagement_platform)} 플랫폼이 가장 높은 인게이지먼트를 기록하였습니다.",
-                styles['Caption']
-            ))
-
-        # 성공한 결과가 충분히 있을 때만 PageBreak
-        success_results = [r for r in results if not r.get("error")]
-        if len(success_results) >= 3:
-            story.append(PageBreak())
-        else:
-            story.append(Spacer(1, 10*mm))
-
-        # ============================================================
-        # 6. 개별 게시물 상세
-        # ============================================================
-        story.append(Paragraph("4. 개별 게시물 상세", styles['SectionHeading']))
-        story.append(HRFlowable(
-            width="100%",
-            thickness=2,
-            color=BRAND_PRIMARY,
-            spaceAfter=5*mm
-        ))
-
-        # 성공한 결과가 없으면 메시지 표시
-        if len(success_results) == 0:
-            story.append(Paragraph(
-                "⚠️ 수집에 성공한 게시물이 없습니다.",
-                styles['BodyText']
-            ))
-            story.append(Spacer(1, 5*mm))
-            story.append(Paragraph(
-                "가능한 원인:\n"
-                "• 플랫폼 로그인 쿠키가 만료됨\n"
-                "• 네트워크 차단 (VPN 필요)\n"
-                "• 게시물이 비공개로 전환됨",
-                styles['Caption']
-            ))
-        else:
-            story.append(Paragraph(
-                f"총 {len(results)}개 게시물 중 {len(success_results)}개 성공 (상위 50개 표시)",
-                styles['Caption']
-            ))
+        story.append(best_header_table)
         story.append(Spacer(1, 3*mm))
 
-        # 게시물 테이블 (개선된 디자인)
-        posts_data = [["No.", "플랫폼", "작성자", "조회수", "좋아요", "댓글", "공유"]]
+        # 인게이지먼트 기준 정렬
+        sorted_results = sorted(
+            success_results,
+            key=lambda x: safe_int(x.get("likes")) + safe_int(x.get("comments")) + safe_int(x.get("shares")) + safe_int(x.get("favorites")),
+            reverse=True
+        )[:4]
+
+        best_cards = []
+        for result in sorted_results:
+            platform = result.get("platform", "unknown")
+            platform_name = PLATFORM_NAMES_KR.get(platform, platform)
+            author = (result.get("author") or "-")[:20]
+            engagement = safe_int(result.get("likes")) + safe_int(result.get("comments")) + safe_int(result.get("shares")) + safe_int(result.get("favorites"))
+
+            # 인게이지먼트 표시 (조회수 대신)
+            engagement_display = format_number(engagement)
+
+            # 썸네일 로딩 시도 (카드 크기에 맞게 38x28mm)
+            thumbnail_url = result.get('thumbnail')
+            thumbnail_img = fetch_thumbnail_image(thumbnail_url, max_size=(38, 28), timeout=3) if thumbnail_url else None
+
+            # 카드 내용 구성 (깔끔한 레이아웃)
+            # 플랫폼/작성자 스타일
+            platform_style = ParagraphStyle(name='BestPlatform', fontName=font_name_bold,
+                fontSize=9, textColor=BRAND_PRIMARY, alignment=1, spaceAfter=2)
+            author_style = ParagraphStyle(name='BestAuthor', fontName=font_name,
+                fontSize=8, textColor=colors.HexColor('#4A5568'), alignment=1)
+            reach_style = ParagraphStyle(name='BestReach', fontName=font_name,
+                fontSize=8, textColor=BRAND_ACCENT, alignment=1, spaceBefore=2)
+
+            author_text = author if author.startswith('@') else f"@{author}"
+            author_text = wrap_cjk_font(author_text)
+
+            if thumbnail_img:
+                card_content = [
+                    [thumbnail_img],  # 썸네일 (정사각형)
+                    [Paragraph(f"<b>{platform_name}</b>", platform_style)],
+                    [Paragraph(author_text, author_style)],
+                    [Paragraph(f"인게이지: {engagement_display}", reach_style)],
+                ]
+                row_heights = [30*mm, 5*mm, 5*mm, 5*mm]  # 썸네일 크게 + 텍스트 분리
+            else:
+                card_content = [
+                    [Paragraph(f"<b>{platform_name}</b>", platform_style)],
+                    [Paragraph(author_text, author_style)],
+                    [Paragraph(f"인게이지: {engagement_display}", reach_style)],
+                ]
+                row_heights = [8*mm, 6*mm, 6*mm]
+
+            best_card = Table(card_content, colWidths=[42*mm], rowHeights=row_heights)
+            best_card.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.white),
+                ('BOX', (0, 0), (-1, -1), 1, BRAND_BORDER),
+                ('LINEABOVE', (0, 0), (-1, 0), 3, BRAND_PRIMARY),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ('LEFTPADDING', (0, 0), (-1, -1), 3),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 3),
+            ]))
+            best_cards.append(best_card)
+
+        # 4개 미만이면 빈 셀 채우기
+        while len(best_cards) < 4:
+            empty_card = Table([[""]], colWidths=[42*mm], rowHeights=[20*mm])
+            best_cards.append(empty_card)
+
+        best_row = Table([best_cards], colWidths=[45*mm, 45*mm, 45*mm, 45*mm])
+        best_row.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ]))
+        story.append(best_row)
+        story.append(Spacer(1, 8*mm))
+
+        # ============================================================
+        # 등록 콘텐츠 섹션 (문서1.jpg 스타일)
+        # ============================================================
+        # 등록 콘텐츠 헤더
+        content_header_data = [[
+            Paragraph(f"<b>등록 콘텐츠</b> {len(results)}", ParagraphStyle(name='ContentHeader', fontName=font_name_bold, fontSize=12, textColor=BRAND_SECONDARY)),
+        ]]
+        content_header_table = Table(content_header_data, colWidths=[180*mm])
+        content_header_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        story.append(content_header_table)
+        story.append(Spacer(1, 3*mm))
+
+        # 게시물 테이블 (계약 범위 내 데이터: 조회수, 인게이지먼트, 좋아요, 댓글, 공유, 저장, URL)
+        posts_data = [["No.", "콘텐츠", "조회수", "인게이지", "좋아요", "댓글", "공유", "저장", "URL"]]
 
         for i, result in enumerate(results[:50], 1):
             platform = result.get("platform", "unknown")
-            author = (result.get("author") or "-")[:12]
+            platform_name = PLATFORM_NAMES_KR.get(platform, platform)
+            author = (result.get("author") or "-")[:20]  # 20자까지 허용
+
+            # 콘텐츠 정보 (플랫폼 + 작성자 + 제목)
+            author_display = author if author.startswith('@') else f"@{author}"
+            author_display = wrap_cjk_font(author_display)
+            # 제목 또는 내용에서 첫 줄 추출 (20자 제한)
+            title = (result.get("title") or result.get("content")
+                     or result.get("description") or result.get("caption") or "")
+            if title:
+                title = title.split('\n')[0][:20]  # 첫 줄 20자
+                title = wrap_cjk_font(title)
+                content_info = f"{platform_name}\n{author_display}\n{title}"
+            else:
+                content_info = f"{platform_name}\n{author_display}"
+
+            # 댓글 수 (comments가 0이면 comments_list 길이 사용)
+            comments_count = safe_int(result.get("comments"))
+            if comments_count == 0 and result.get("comments_list"):
+                comments_count = len(result.get("comments_list"))
+
+            # 인게이지먼트 계산
+            engagement = safe_int(result.get("likes")) + comments_count + safe_int(result.get("shares")) + safe_int(result.get("favorites"))
 
             # 에러가 있는 경우 표시
             if result.get("error"):
-                author = f"{author} (오류)"
+                content_info = f"{platform_name}\n(오류)"
+
+            # content_info를 Paragraph로 변환 (CJK 폰트 태그 렌더링 위해)
+            content_para = Paragraph(
+                content_info.replace('\n', '<br/>'),
+                ParagraphStyle(name='CellContent', fontName=font_name, fontSize=7, leading=10)
+            )
+
+            # URL 링크 생성
+            url = result.get("url", "")
+            if url:
+                url_para = Paragraph(f'<link href="{url}">링크</link>',
+                    ParagraphStyle(name='URLLink', fontName=font_name, fontSize=7, textColor=colors.blue))
+            else:
+                url_para = "-"
 
             posts_data.append([
                 str(i),
-                PLATFORM_NAMES_KR.get(platform, platform),
-                author,
-                format_number(safe_int(result.get("views"))),
-                format_number(safe_int(result.get("likes"))),
-                format_number(safe_int(result.get("comments"))),
-                format_number(safe_int(result.get("shares"))),
+                content_para,
+                format_metric(result.get("views")),
+                format_number(engagement),
+                format_metric(result.get("likes")),
+                format_number(comments_count),
+                format_metric(result.get("shares")),
+                format_metric(result.get("favorites")),
+                url_para,
             ])
 
         posts_table = Table(
             posts_data,
-            colWidths=[12*mm, 25*mm, 45*mm, 25*mm, 22*mm, 20*mm, 20*mm]
+            colWidths=[7*mm, 38*mm, 18*mm, 18*mm, 18*mm, 15*mm, 15*mm, 15*mm, 12*mm]
         )
         posts_table.setStyle(TableStyle([
             # 헤더
             ('BACKGROUND', (0, 0), (-1, 0), BRAND_PRIMARY),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('FONTNAME', (0, 0), (-1, 0), font_name_bold),
-            ('FONTSIZE', (0, 0), (-1, 0), 8),
+            ('FONTSIZE', (0, 0), (-1, 0), 7),
 
             # 본문
             ('FONTNAME', (0, 1), (-1, -1), font_name),
-            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('FONTSIZE', (0, 1), (-1, -1), 7),
 
             # 정렬
             ('ALIGN', (0, 0), (0, -1), 'CENTER'),
-            ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
+            ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
 
             # 그리드
             ('GRID', (0, 0), (-1, -1), 0.3, BRAND_BORDER),
@@ -1181,113 +1082,227 @@ class PDFReportGenerator:
             # 패딩
             ('TOPPADDING', (0, 0), (-1, -1), 4),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-            ('LEFTPADDING', (0, 0), (-1, -1), 4),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 3),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 3),
         ]))
         story.append(posts_table)
 
         if len(results) > 50:
             story.append(Spacer(1, 3*mm))
             story.append(Paragraph(
-                f"* 지면 관계상 총 {len(results)}개 중 50개만 표시됩니다. 전체 데이터는 별도 파일로 제공됩니다.",
+                f"* 총 {len(results)}개 중 50개만 표시",
                 styles['Caption']
             ))
 
-        # 게시물이 많을 때만 PageBreak
-        if len(results) > 10:
-            story.append(PageBreak())
-        else:
-            story.append(Spacer(1, 10*mm))
-
         # ============================================================
-        # 7. 결론 및 제언
+        # URL 목록 섹션
         # ============================================================
-        story.append(Paragraph("5. 결론 및 제언", styles['SectionHeading']))
-        story.append(HRFlowable(
-            width="100%",
-            thickness=2,
-            color=BRAND_PRIMARY,
-            spaceAfter=8*mm
-        ))
-
-        story.append(Paragraph("5.1 캠페인 성과 요약", styles['SubHeading']))
-
-        # 결론 텍스트 생성
-        conclusion_text = f"""
-        본 캠페인은 {start_date}부터 {end_date}까지 진행되었으며,
-        총 <b>{total_posts}개</b>의 게시물을 통해 <b>{format_number(total_views)}</b>의 조회수와
-        <b>{format_number(total_engagement)}</b>의 총 인게이지먼트를 달성하였습니다.
-        """
-
-        if best_platform:
-            conclusion_text += f"""
-            <br/><br/>
-            채널별로는 <b>{best_platform_name}</b>이(가) 가장 높은 성과를 기록하였으며,
-            해당 플랫폼의 특성을 고려한 콘텐츠 전략이 효과적이었던 것으로 분석됩니다.
-            """
-
-        story.append(Paragraph(conclusion_text, styles['BodyText']))
         story.append(Spacer(1, 8*mm))
-
-        story.append(Paragraph("5.2 주요 인사이트", styles['SubHeading']))
-
-        # 인사이트 리스트
-        insights = []
-        if total_views > 0:
-            views_per_post = total_views / total_posts if total_posts > 0 else 0
-            insights.append(f"게시물당 평균 조회수: {format_number(int(views_per_post))}")
-
-        if total_engagement > 0:
-            engagement_rate = (total_engagement / total_views * 100) if total_views > 0 else 0
-            if engagement_rate > 0:
-                insights.append(f"평균 인게이지먼트율: {engagement_rate:.2f}%")
-
-        if best_platform:
-            best_stats = platform_stats.get(best_platform, {})
-            best_posts = best_stats.get('count', 0)
-            insights.append(f"최고 성과 플랫폼: {best_platform_name} ({best_posts}개 게시물)")
-
-        if platform_count > 1:
-            insights.append(f"{platform_count}개 플랫폼에서 동시 캠페인 진행")
-
-        for insight in insights:
-            insight_item = Table(
-                [[Paragraph(f"  {insight}", styles['BodyText'])]],
-                colWidths=[165*mm]
-            )
-            insight_item.setStyle(TableStyle([
-                ('LEFTPADDING', (0, 0), (-1, -1), 15),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-            ]))
-            story.append(insight_item)
-
-        story.append(Spacer(1, 10*mm))
-
-        # 마무리 박스
-        closing_text = """
-        <b>감사합니다</b><br/><br/>
-        본 리포트에 대한 문의사항이 있으시면 언제든 연락 주시기 바랍니다.<br/>
-        더 나은 캠페인 성과를 위해 최선을 다하겠습니다.
-        """
-        closing_table = Table(
-            [[Paragraph(closing_text, styles['BodyText'])]],
-            colWidths=[165*mm]
+        url_header = Paragraph(
+            "<b>콘텐츠 URL 목록</b>",
+            ParagraphStyle(name='URLHeader', fontName=font_name_bold, fontSize=10, textColor=BRAND_SECONDARY)
         )
-        closing_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), BRAND_LIGHT),
-            ('BOX', (0, 0), (-1, -1), 1, BRAND_BORDER),
-            ('LEFTPADDING', (0, 0), (-1, -1), 15),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 15),
-            ('TOPPADDING', (0, 0), (-1, -1), 15),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 15),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        story.append(url_header)
+        story.append(Spacer(1, 2*mm))
+
+        # URL 목록 (최대 50개)
+        url_style = ParagraphStyle(
+            name='URLText',
+            fontName=font_name,
+            fontSize=6,
+            textColor=colors.HexColor('#4A5568'),
+            leading=9
+        )
+
+        url_list_items = []
+        for i, result in enumerate(results[:50], 1):
+            url = result.get("url", "-")
+            platform = result.get("platform", "unknown")
+            platform_name = PLATFORM_NAMES_KR.get(platform, platform)
+            # URL 표시 (너무 길면 중간 생략)
+            if len(url) > 70:
+                url_display = url[:35] + "..." + url[-30:]
+            else:
+                url_display = url
+            url_list_items.append(f"{i}. [{platform_name}] {url_display}")
+
+        # 2열로 나누어 표시
+        mid = (len(url_list_items) + 1) // 2
+        col1 = "\n".join(url_list_items[:mid])
+        col2 = "\n".join(url_list_items[mid:])
+
+        url_table = Table([
+            [Paragraph(col1, url_style), Paragraph(col2, url_style)]
+        ], colWidths=[90*mm, 90*mm])
+        url_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 2),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 2),
         ]))
-        story.append(closing_table)
+        story.append(url_table)
+
+        # ============================================================
+        # 게시물 본문 섹션
+        # ============================================================
+        posts_with_content = [r for r in results if not r.get("error") and (r.get("content") or r.get("title") or r.get("caption") or r.get("description"))]
+
+        if posts_with_content:
+            story.append(Spacer(1, 8*mm))
+            content_section_header = Paragraph(
+                "<b>게시물 본문</b>",
+                ParagraphStyle(name='ContentSectionHeader', fontName=font_name_bold, fontSize=12, textColor=BRAND_SECONDARY)
+            )
+            story.append(content_section_header)
+            story.append(Spacer(1, 3*mm))
+
+            for idx, result in enumerate(posts_with_content, 1):
+                platform = result.get("platform", "unknown")
+                platform_name = PLATFORM_NAMES_KR.get(platform, platform)
+                author = (result.get("author") or "-")[:20]
+                author_display = author if author.startswith('@') else f"@{author}"
+                author_display = wrap_cjk_font(author_display)
+
+                # 게시물 헤더 (번호 + 플랫폼 + 작성자)
+                post_header = Paragraph(
+                    f"<b>{idx}. {platform_name}</b> {author_display}",
+                    ParagraphStyle(name='PostContentHeader', fontName=font_name_bold, fontSize=9, textColor=BRAND_PRIMARY, spaceBefore=3*mm)
+                )
+                story.append(post_header)
+
+                # 본문 내용 (title + content 중복 제거)
+                title_text = (result.get("title") or "").strip()
+                body_text = (result.get("content") or result.get("caption") or result.get("description") or "").strip()
+
+                # 중복 제거: 동일하거나, 한쪽이 다른 쪽에 포함되면 긴 쪽만 표시
+                if title_text and body_text:
+                    if title_text == body_text:
+                        body_text = ""
+                    elif body_text.startswith(title_text[:30]):
+                        # content가 title로 시작하면 content만 표시 (샤오홍슈 등)
+                        title_text = ""
+                    elif title_text.startswith(body_text[:30]):
+                        # title이 content로 시작하면 title만 표시
+                        body_text = ""
+
+                display_text = ""
+                if title_text:
+                    title_text = title_text[:200]
+                    title_text = wrap_cjk_font(title_text)
+                    display_text += f"<b>{title_text}</b>"
+                if body_text:
+                    body_text = body_text[:500]
+                    body_text = wrap_cjk_font(body_text)
+                    if display_text:
+                        display_text += f"<br/>{body_text}"
+                    else:
+                        display_text = body_text
+
+                if display_text:
+                    content_para = Paragraph(
+                        display_text,
+                        ParagraphStyle(name='PostContentBody', fontName=font_name, fontSize=8, leading=12,
+                                       textColor=BRAND_SECONDARY, leftIndent=5*mm, spaceBefore=1*mm, spaceAfter=2*mm)
+                    )
+                    story.append(content_para)
+
+        # ============================================================
+        # 댓글 샘플 섹션 (인게이지먼트 상위 게시물의 댓글)
+        # ============================================================
+        # 댓글이 있는 게시물 필터링 (comments_list가 있거나 댓글 수가 0보다 큰 경우)
+        posts_with_comments = [r for r in sorted_results if r.get('comments_list') or safe_int(r.get('comments', 0)) > 0]
+
+        if posts_with_comments:
+            story.append(Spacer(1, 8*mm))
+
+            # 댓글 섹션 헤더
+            comment_header = Paragraph(
+                "<b>댓글 샘플</b> (Best 콘텐츠)",
+                ParagraphStyle(name='CommentHeader', fontName=font_name_bold, fontSize=12, textColor=BRAND_SECONDARY)
+            )
+            story.append(comment_header)
+            story.append(Spacer(1, 3*mm))
+
+            # 상위 4개 게시물의 댓글 표시
+            for result in posts_with_comments[:4]:
+                platform = result.get("platform", "unknown")
+                platform_name = PLATFORM_NAMES_KR.get(platform, platform)
+                author = (result.get("author") or "-")[:15]
+                comments_list = result.get("comments_list", [])
+                comments_count = safe_int(result.get("comments", 0))
+
+                # 게시물 제목
+                author_display = author if author.startswith('@') else f"@{author}"
+                author_display = wrap_cjk_font(author_display)
+                post_title = Paragraph(
+                    f"<b>{platform_name}</b> {author_display}",
+                    ParagraphStyle(name='CommentPostTitle', fontName=font_name_bold, fontSize=9, textColor=BRAND_PRIMARY, spaceBefore=3*mm)
+                )
+                story.append(post_title)
+
+                # comments_list가 비어있지만 댓글 수가 있는 경우
+                if not comments_list:
+                    no_comments_msg = Paragraph(
+                        f"<font color='#a0aec0'>[댓글 내용 수집 불가 - 총 {comments_count}개]</font>",
+                        ParagraphStyle(name='NoComments', fontName=font_name, fontSize=8, textColor=colors.HexColor('#a0aec0'), leftIndent=5*mm, spaceBefore=1*mm)
+                    )
+                    story.append(no_comments_msg)
+                    continue
+
+                # 댓글 목록 (최대 5개)
+                for comment in comments_list[:5]:
+                    comment_author = comment.get("author", "익명")[:10]
+                    comment_text = comment.get("text", "")[:100]  # 100자 제한
+                    comment_likes = comment.get("likes", 0)
+
+                    if comment_text:
+                        # 이모지만 있는 댓글 처리 (reportlab이 이모지 지원 안함)
+                        import re
+                        # 이모지 패턴: 대부분의 이모지 범위
+                        emoji_pattern = re.compile(
+                            "["
+                            "\U0001F600-\U0001F64F"  # 이모티콘
+                            "\U0001F300-\U0001F5FF"  # 기호 & 픽토그램
+                            "\U0001F680-\U0001F6FF"  # 교통 & 지도
+                            "\U0001F1E0-\U0001F1FF"  # 국기
+                            "\U00002702-\U000027B0"  # 딩벳
+                            "\U0001F900-\U0001F9FF"  # 보충 기호
+                            "\U0001FA00-\U0001FA6F"  # 체스 기호
+                            "\U00002600-\U000026FF"  # 기타 기호
+                            "\U00002B50-\U00002B55"  # 별 등
+                            "]+", flags=re.UNICODE
+                        )
+                        # 이모지 제거 후 텍스트만 남기기
+                        text_only = emoji_pattern.sub('', comment_text).strip()
+                        if not text_only:
+                            # 이모지만 있는 댓글
+                            comment_text = "[이모지 반응]"
+                        else:
+                            # 이모지 제거하고 텍스트만 표시
+                            comment_text = text_only
+
+                        # 특수문자 이스케이프는 wrap_cjk_font 내부에서 처리
+
+                        comment_author_display = comment_author if comment_author.startswith('@') else f"@{comment_author}"
+                        comment_author_display = wrap_cjk_font(comment_author_display)
+                        comment_text = wrap_cjk_font(comment_text)
+                        comment_para = Paragraph(
+                            f"<font color='#718096'>{comment_author_display}</font>: {comment_text} <font color='#a0aec0'>({comment_likes} 좋아요)</font>",
+                            ParagraphStyle(name='CommentText', fontName=font_name, fontSize=8, textColor=BRAND_SECONDARY, leftIndent=5*mm, spaceBefore=1*mm)
+                        )
+                        story.append(comment_para)
+
+        # 푸터 (생성일)
+        story.append(Spacer(1, 10*mm))
+        footer_text = Paragraph(
+            f"생성일: {datetime.now().strftime('%Y-%m-%d %H:%M')} | {campaign_name} | {advertiser_name}",
+            ParagraphStyle(name='Footer', fontName=font_name, fontSize=8, textColor=colors.HexColor('#a0aec0'), alignment=TA_CENTER)
+        )
+        story.append(footer_text)
 
         # ============================================================
         # PDF 빌드
         # ============================================================
-        doc.build(story, onFirstPage=add_page_header_footer, onLaterPages=add_page_header_footer)
+        doc.build(story, onFirstPage=add_page_footer, onLaterPages=add_page_footer)
 
         # 바이트 데이터 추출
         pdf_bytes = buffer.getvalue()
@@ -1357,6 +1372,148 @@ class PDFReportGenerator:
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('TOPPADDING', (0, 0), (-1, -1), 5),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]))
+
+        return card
+
+    def _create_metric_card_simple(
+        self,
+        title: str,
+        value: str,
+        color,
+        font_name: str,
+        font_name_bold: str,
+        bg_color=None
+    ):
+        """
+        단순 지표 카드 생성 (문서1.jpg 스타일 - 콘텐츠수용)
+
+        Args:
+            title: 카드 제목
+            value: 지표 값
+            color: 강조 색상
+            font_name: 일반 폰트명
+            font_name_bold: 굵은 폰트명
+            bg_color: 배경 색상
+
+        Returns:
+            Table 객체
+        """
+        from reportlab.lib import colors
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import Paragraph, Table, TableStyle
+
+        title_style = ParagraphStyle(
+            name='CardTitleSimple',
+            fontName=font_name,
+            fontSize=9,
+            textColor=colors.HexColor('#718096'),
+            alignment=1
+        )
+
+        value_style = ParagraphStyle(
+            name='CardValueSimple',
+            fontName=font_name_bold,
+            fontSize=22,
+            textColor=color,
+            alignment=1
+        )
+
+        card_data = [
+            [Paragraph(title, title_style)],
+            [Paragraph(value, value_style)],
+        ]
+
+        card = Table(card_data, colWidths=[42*mm], rowHeights=[10*mm, 18*mm])
+        card.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), bg_color or colors.white),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#e2e8f0')),
+            ('LINEABOVE', (0, 0), (-1, 0), 3, color),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]))
+
+        return card
+
+    def _create_metric_card_v2(
+        self,
+        title: str,
+        total_value: str,
+        avg_value: str,
+        color,
+        font_name: str,
+        font_name_bold: str
+    ):
+        """
+        누적/평균을 표시하는 지표 카드 생성 (고객 요청 스타일)
+
+        Args:
+            title: 카드 제목 (예: "총 인게이지먼트")
+            total_value: 누적 값
+            avg_value: 콘텐츠 평균 값
+            color: 강조 색상
+            font_name: 일반 폰트명
+            font_name_bold: 굵은 폰트명
+
+        Returns:
+            Table 객체
+        """
+        from reportlab.lib import colors
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import Paragraph, Table, TableStyle
+
+        title_style = ParagraphStyle(
+            name='CardTitleV2',
+            fontName=font_name,
+            fontSize=9,
+            textColor=colors.HexColor('#718096'),
+            alignment=1  # CENTER
+        )
+
+        total_label_style = ParagraphStyle(
+            name='TotalLabel',
+            fontName=font_name,
+            fontSize=7,
+            textColor=colors.HexColor('#a0aec0'),
+            alignment=1
+        )
+
+        total_value_style = ParagraphStyle(
+            name='TotalValue',
+            fontName=font_name_bold,
+            fontSize=20,
+            textColor=color,
+            alignment=1
+        )
+
+        avg_style = ParagraphStyle(
+            name='AvgStyle',
+            fontName=font_name,
+            fontSize=8,
+            textColor=colors.HexColor('#718096'),
+            alignment=1
+        )
+
+        card_data = [
+            [Paragraph(title, title_style)],
+            [Paragraph("누적", total_label_style)],
+            [Paragraph(total_value, total_value_style)],
+            [Paragraph(f"콘텐츠 평균 {avg_value}", avg_style)],
+        ]
+
+        card = Table(card_data, colWidths=[42*mm], rowHeights=[7*mm, 5*mm, 14*mm, 6*mm])
+        card.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.white),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#e2e8f0')),
+            ('LINEABOVE', (0, 0), (-1, 0), 3, color),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
         ]))
 
         return card

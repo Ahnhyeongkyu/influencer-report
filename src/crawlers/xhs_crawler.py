@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 import platform
+import sys
 import requests
 
 from selenium import webdriver
@@ -45,8 +46,16 @@ IS_CLOUD = platform.system() == "Linux" and os.path.exists("/etc/debian_version"
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# 콘솔 핸들러 추가 (기본)
-if not logger.handlers:
+# 파일 핸들러 추가 (디버그용)
+_log_dir = Path(__file__).parent.parent.parent / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.FileHandler(_log_dir / "xhs_debug.log", encoding="utf-8", mode="w")
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(_file_handler)
+
+# 콘솔 핸들러
+if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in logger.handlers):
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
@@ -54,6 +63,69 @@ if not logger.handlers:
     )
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+
+
+def parse_chinese_number(value) -> int:
+    """
+    중국어 숫자 포맷을 정수로 변환
+    예: "2.6万" -> 26000, "1.5亿" -> 150000000, "2627" -> 2627
+
+    Args:
+        value: 숫자 값 (문자열 또는 정수)
+
+    Returns:
+        정수 값
+    """
+    if value is None:
+        return 0
+
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    if not isinstance(value, str):
+        return 0
+
+    value = value.strip()
+    if not value:
+        return 0
+
+    try:
+        # 순수 숫자인 경우
+        return int(value)
+    except ValueError:
+        pass
+
+    try:
+        # 소수점 숫자인 경우
+        return int(float(value))
+    except ValueError:
+        pass
+
+    # 중국어 단위 처리
+    multiplier = 1
+
+    if '亿' in value:
+        multiplier = 100000000  # 억
+        value = value.replace('亿', '')
+    elif '万' in value:
+        multiplier = 10000  # 만
+        value = value.replace('万', '')
+    elif 'w' in value.lower():
+        multiplier = 10000  # 만 (영어 약어)
+        value = value.lower().replace('w', '')
+    elif 'k' in value.lower():
+        multiplier = 1000
+        value = value.lower().replace('k', '')
+
+    try:
+        # 남은 숫자 파싱
+        value = value.strip()
+        if value:
+            return int(float(value) * multiplier)
+    except ValueError:
+        pass
+
+    return 0
 
 
 class XHSCrawlerError(Exception):
@@ -108,6 +180,8 @@ class XHSCrawler:
         timeout: int = DEFAULT_TIMEOUT,
         cookie_file: Optional[str] = None,
         use_api: bool = True,  # API 방식 우선 사용
+        collect_comments: bool = False,  # 댓글 수집 여부
+        max_comments: int = 10,  # 최대 댓글 수
     ):
         """
         크롤러 초기화
@@ -124,6 +198,8 @@ class XHSCrawler:
         self.timeout = timeout
         self.cookie_file = Path(cookie_file) if cookie_file else self.COOKIE_FILE
         self.use_api = use_api
+        self.collect_comments = collect_comments
+        self.max_comments = max_comments
 
         self.driver: Optional[webdriver.Chrome] = None
         self.is_logged_in = False
@@ -240,11 +316,14 @@ class XHSCrawler:
             "author": None,
             "author_id": None,
             "title": None,
+            "content": None,  # 게시물 본문
             "likes": 0,
             "favorites": 0,
             "comments": 0,
             "shares": 0,
             "views": None,
+            "thumbnail": None,
+            "comments_list": [],
             "crawled_at": datetime.now().isoformat(),
         }
 
@@ -286,15 +365,54 @@ class XHSCrawler:
                                     break
 
                         if note_data:
-                            result['title'] = note_data.get('title', '') or note_data.get('desc', '')
+                            # title과 content를 분리하여 추출
+                            raw_title = note_data.get('title', '')
+                            raw_desc = note_data.get('desc', '')
+
+                            # 플레이스홀더 텍스트 필터링
+                            placeholder_texts = ["还没有简介", "暂无简介", "没有描述", "暂无描述", "暂无内容", ""]
+
+                            # title 설정 (플레이스홀더가 아닌 경우만)
+                            if raw_title and raw_title.strip() not in placeholder_texts:
+                                result['title'] = raw_title
+                            elif raw_desc and raw_desc.strip() not in placeholder_texts:
+                                result['title'] = raw_desc[:100]
+
+                            # content 설정
+                            if raw_desc and raw_desc.strip() not in placeholder_texts:
+                                result['content'] = raw_desc
 
                             # interactInfo에서 상호작용 정보 추출
                             interact_info = note_data.get('interactInfo', {})
                             if interact_info:
-                                result['likes'] = int(interact_info.get('likedCount', 0) or 0)
-                                result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
-                                result['comments'] = int(interact_info.get('commentCount', 0) or 0)
-                                result['shares'] = int(interact_info.get('shareCount', 0) or 0)
+                                logger.info(f"interactInfo 키: {list(interact_info.keys())}")
+                                result['likes'] = parse_chinese_number(
+                                    interact_info.get('likedCount') or interact_info.get('liked_count') or interact_info.get('likes') or 0)
+                                result['favorites'] = parse_chinese_number(
+                                    interact_info.get('collectedCount') or interact_info.get('collected_count') or interact_info.get('collectCount') or interact_info.get('bookmarkedCount') or 0)
+                                result['comments'] = parse_chinese_number(
+                                    interact_info.get('commentCount') or interact_info.get('comment_count') or interact_info.get('comments') or 0)
+                                result['shares'] = parse_chinese_number(
+                                    interact_info.get('shareCount') or interact_info.get('share_count') or interact_info.get('shares') or 0)
+
+                            # 댓글 수를 comment 섹션에서도 시도
+                            if result['comments'] == 0:
+                                comment_section = data.get('comment', {})
+                                if comment_section:
+                                    result['comments'] = parse_chinese_number(
+                                        comment_section.get('commentCount') or comment_section.get('total') or comment_section.get('count') or 0)
+                                    logger.info(f"comment 섹션에서 댓글 수 추출: {result['comments']}")
+
+                            # favorites를 note_data 직접 필드에서도 시도
+                            if result['favorites'] == 0:
+                                result['favorites'] = parse_chinese_number(
+                                    note_data.get('collectedCount') or note_data.get('collectCount') or 0)
+                            if result['shares'] == 0:
+                                result['shares'] = parse_chinese_number(
+                                    note_data.get('shareCount') or note_data.get('share_count') or 0)
+                            if result['comments'] == 0:
+                                result['comments'] = parse_chinese_number(
+                                    note_data.get('commentCount') or note_data.get('comment_count') or 0)
 
                             # user 정보에서 작성자 추출
                             user = note_data.get('user', {})
@@ -302,33 +420,74 @@ class XHSCrawler:
                                 result['author'] = user.get('nickname') or user.get('name')
                                 result['author_id'] = user.get('userId') or user.get('uid')
 
+                            # imageList에서 썸네일 추출
+                            image_list = note_data.get('imageList', [])
+                            if image_list and len(image_list) > 0:
+                                first_image = image_list[0]
+                                if isinstance(first_image, dict):
+                                    # urlDefault 또는 url 사용
+                                    result['thumbnail'] = first_image.get('urlDefault') or first_image.get('url') or first_image.get('infoList', [{}])[0].get('url')
+                                elif isinstance(first_image, str):
+                                    result['thumbnail'] = first_image
+
                             if result.get('likes', 0) > 0 or result.get('author'):
-                                logger.info(f"noteDetailMap에서 데이터 추출 성공: likes={result['likes']}, author={result['author']}")
+                                logger.info(f"noteDetailMap에서 데이터 추출 성공: likes={result['likes']}, author={result['author']}, thumbnail={'있음' if result.get('thumbnail') else '없음'}")
                                 return result
 
                     # 구버전 구조: note.note
                     note_data = data.get('note', {}).get('note', {})
                     if note_data:
-                        result['title'] = note_data.get('title', '') or note_data.get('desc', '')
+                        # title과 content를 분리하여 추출
+                        raw_title = note_data.get('title', '')
+                        raw_desc = note_data.get('desc', '')
+
+                        # 플레이스홀더 텍스트 필터링
+                        if raw_title and raw_title.strip() not in placeholder_texts:
+                            result['title'] = raw_title
+                        elif raw_desc and raw_desc.strip() not in placeholder_texts:
+                            result['title'] = raw_desc[:100]
+
+                        # content 설정
+                        if raw_desc and raw_desc.strip() not in placeholder_texts:
+                            result['content'] = raw_desc
 
                         # interactInfo 우선
                         interact_info = note_data.get('interactInfo', {})
                         if interact_info:
-                            result['likes'] = int(interact_info.get('likedCount', 0) or 0)
-                            result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
-                            result['comments'] = int(interact_info.get('commentCount', 0) or 0)
-                            result['shares'] = int(interact_info.get('shareCount', 0) or 0)
-                        else:
-                            # 직접 필드
-                            result['likes'] = int(note_data.get('likedCount', 0) or 0)
-                            result['favorites'] = int(note_data.get('collectedCount', 0) or 0)
-                            result['comments'] = int(note_data.get('commentCount', 0) or 0)
-                            result['shares'] = int(note_data.get('shareCount', 0) or 0)
+                            result['likes'] = parse_chinese_number(
+                                interact_info.get('likedCount') or interact_info.get('likes') or 0)
+                            result['favorites'] = parse_chinese_number(
+                                interact_info.get('collectedCount') or interact_info.get('collectCount') or interact_info.get('bookmarkedCount') or 0)
+                            result['comments'] = parse_chinese_number(
+                                interact_info.get('commentCount') or interact_info.get('comments') or 0)
+                            result['shares'] = parse_chinese_number(
+                                interact_info.get('shareCount') or interact_info.get('shares') or 0)
+                        # 직접 필드 fallback
+                        if result.get('likes', 0) == 0:
+                            result['likes'] = parse_chinese_number(note_data.get('likedCount', 0))
+                        if result.get('favorites', 0) == 0:
+                            result['favorites'] = parse_chinese_number(
+                                note_data.get('collectedCount') or note_data.get('collectCount') or 0)
+                        if result.get('comments', 0) == 0:
+                            result['comments'] = parse_chinese_number(
+                                note_data.get('commentCount') or note_data.get('comment_count') or 0)
+                        if result.get('shares', 0) == 0:
+                            result['shares'] = parse_chinese_number(
+                                note_data.get('shareCount') or note_data.get('share_count') or 0)
 
                         user = note_data.get('user', {})
                         if user:
                             result['author'] = user.get('nickname') or user.get('name')
                             result['author_id'] = user.get('userId') or user.get('uid')
+
+                        # imageList에서 썸네일 추출
+                        image_list = note_data.get('imageList', [])
+                        if image_list and len(image_list) > 0:
+                            first_image = image_list[0]
+                            if isinstance(first_image, dict):
+                                result['thumbnail'] = first_image.get('urlDefault') or first_image.get('url')
+                            elif isinstance(first_image, str):
+                                result['thumbnail'] = first_image
 
                         if result.get('likes', 0) > 0 or result.get('author'):
                             logger.info(f"note.note에서 데이터 추출 성공: likes={result['likes']}, author={result['author']}")
@@ -393,15 +552,71 @@ class XHSCrawler:
                     result['author'] = match.group(1)
                     break
 
-            # 제목 추출
+            # 추가 작성자 패턴 (다양한 JSON 구조 대응)
+            if not result.get('author'):
+                extra_author_patterns = [
+                    # noteCard 구조
+                    r'"noteCard"[^}]*"user"[^}]*"nickname"\s*:\s*"([^"]+)"',
+                    # 직접 user 객체
+                    r'"user"\s*:\s*\{[^}]*"nickname"\s*:\s*"([^"]+)"',
+                    # basicInfo 구조
+                    r'"basicInfo"[^}]*"nickname"\s*:\s*"([^"]+)"',
+                    # name 필드
+                    r'"user"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                ]
+                for pattern in extra_author_patterns:
+                    match = re.search(pattern, html, re.DOTALL)
+                    if match:
+                        author_name = match.group(1)
+                        # 로그인 사용자 이름이 아닌지 확인 (일반적으로 짧은 이름)
+                        if author_name and len(author_name) < 30:
+                            result['author'] = author_name
+                            break
+
+            # 제목 추출 (플레이스홀더 필터링)
+            placeholder_texts = ["还没有简介", "暂无简介", "没有描述", "暂无描述", "暂无内容"]
             for pattern in title_patterns:
                 match = re.search(pattern, html, re.DOTALL)
                 if match:
-                    result['title'] = match.group(1)
-                    break
+                    title_text = match.group(1)
+                    # 플레이스홀더가 아닌 경우만 설정
+                    if title_text and title_text.strip() not in placeholder_texts:
+                        result['title'] = title_text
+                        break
+
+            # 썸네일 정규식 추출 (실제 콘텐츠 이미지 우선)
+            if not result.get('thumbnail'):
+                thumbnail_patterns = [
+                    # 실제 콘텐츠 이미지 (sns-webpic, sns-img 등) - 이스케이프 포함
+                    r'"urlDefault"\s*:\s*"(https?:\\?u?002F\\?u?002Fsns-[^"]+)"',
+                    r'"url"\s*:\s*"(https?:\\?u?002F\\?u?002Fsns-[^"]+)"',
+                    # 일반 형식
+                    r'"urlDefault"\s*:\s*"(https?://sns-[^"]+\.xhscdn\.com[^"]+)"',
+                    r'"url"\s*:\s*"(https?://sns-[^"]+\.xhscdn\.com[^"]+)"',
+                    # imageList 내부 URL
+                    r'"imageList"\s*:\s*\[[^\]]*"urlDefault"\s*:\s*"([^"]+)"',
+                    r'"imageList"\s*:\s*\[[^\]]*"url"\s*:\s*"([^"]+)"',
+                    # cover 필드
+                    r'"cover"\s*:\s*\{[^}]*"urlDefault"\s*:\s*"([^"]+)"',
+                    r'"cover"\s*:\s*\{[^}]*"url"\s*:\s*"([^"]+)"',
+                    # infoList 내부
+                    r'"infoList"\s*:\s*\[[^\]]*"url"\s*:\s*"(https?://[^"]+)"',
+                    # 일반 xhscdn (마지막 fallback, 정적 자산 제외)
+                    r'"urlDefault"\s*:\s*"(https?://(?!fe-static)[^"]+xhscdn[^"]+)"',
+                ]
+                for pattern in thumbnail_patterns:
+                    match = re.search(pattern, html, re.DOTALL)
+                    if match:
+                        thumb_url = match.group(1)
+                        # Unicode 이스케이프 디코딩 (\u002F -> /)
+                        thumb_url = thumb_url.encode().decode('unicode_escape')
+                        # 정적 자산 URL 제외
+                        if 'fe-static' not in thumb_url and ('http://' in thumb_url or 'https://' in thumb_url):
+                            result['thumbnail'] = thumb_url
+                            break
 
             if result.get('likes', 0) > 0 or result.get('favorites', 0) > 0 or result.get('author'):
-                logger.info(f"정규식으로 데이터 추출: likes={result['likes']}, author={result['author']}")
+                logger.info(f"정규식으로 데이터 추출: likes={result['likes']}, author={result['author']}, thumbnail={'있음' if result.get('thumbnail') else '없음'}")
                 return result
 
             return None
@@ -561,12 +776,29 @@ class XHSCrawler:
 
             # 쿠키에서 로그인 관련 토큰 확인 (web_session만 확인)
             cookies = self.driver.get_cookies()
+            has_session = False
             for cookie in cookies:
                 if cookie.get("name") == "web_session" and cookie.get("value"):
-                    # web_session 값이 충분히 긴지 확인 (실제 로그인 세션)
                     if len(cookie.get("value", "")) > 50:
-                        logger.info("로그인 세션 쿠키 확인됨")
-                        return True
+                        has_session = True
+                        break
+
+            if has_session:
+                # 실제 페이지에서 로그인 상태 재검증
+                page_source = self.driver.page_source
+                # QR 로그인 화면 또는 로그인 유도 감지
+                login_indicators = ['扫码', 'qrcode', '登录', '验证', 'login']
+                login_detected = sum(1 for ind in login_indicators if ind.lower() in page_source.lower())
+                if login_detected >= 2:
+                    print(f"[XHS] 쿠키 만료 감지 (로그인 키워드 {login_detected}개)")
+                    return False
+                # 실제 게시물이나 피드가 보이는지 확인
+                has_content = '小红书' in page_source or 'explore' in page_source
+                if has_content:
+                    print("[XHS] 로그인 세션 쿠키 유효")
+                    return True
+                print("[XHS] 쿠키 상태 불확실 - 유효로 간주")
+                return True
 
             return False
 
@@ -739,9 +971,252 @@ class XHSCrawler:
 
         return 0
 
+    def _extract_comments(self, data_source) -> list:
+        """
+        댓글 데이터 추출
+
+        Args:
+            data_source: JSON 문자열 또는 딕셔너리
+
+        Returns:
+            댓글 리스트 [{"author": str, "text": str}, ...]
+        """
+        comments_list = []
+
+        try:
+            # JSON 파싱
+            if isinstance(data_source, str):
+                try:
+                    data = json.loads(data_source)
+                except json.JSONDecodeError:
+                    return comments_list
+            else:
+                data = data_source
+
+            # comment 섹션에서 댓글 추출
+            comment_section = data.get('comment', {})
+
+            # comments 배열 찾기 (여러 경로 시도)
+            comments_data = (
+                comment_section.get('comments', []) or
+                comment_section.get('commentList', []) or
+                data.get('comments', [])
+            )
+
+            for comment in comments_data[:self.max_comments]:
+                if not isinstance(comment, dict):
+                    continue
+
+                # 작성자 추출
+                user_info = comment.get('user', {}) or comment.get('userInfo', {})
+                author = (
+                    user_info.get('nickname') or
+                    user_info.get('name') or
+                    user_info.get('userName') or
+                    comment.get('nickname') or
+                    '익명'
+                )
+
+                # 댓글 내용 추출
+                content = (
+                    comment.get('content') or
+                    comment.get('text') or
+                    comment.get('note') or
+                    ''
+                )
+
+                # 공백 정리 (여러 공백을 하나로)
+                if content:
+                    content = ' '.join(content.split())
+
+                if author and content:
+                    comments_list.append({
+                        "author": author,
+                        "text": content
+                    })
+
+            logger.info(f"댓글 {len(comments_list)}개 추출")
+
+        except Exception as e:
+            logger.debug(f"댓글 추출 실패: {e}")
+
+        # JSON에서 못 찾으면 DOM에서 추출 시도
+        if not comments_list and self.driver:
+            try:
+                from selenium.webdriver.common.by import By
+                # XHS 댓글 DOM 패턴
+                comment_elements = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    'div.comment-item, div[class*="comment"], div.note-comment'
+                )
+                for elem in comment_elements[:self.max_comments]:
+                    try:
+                        author_el = elem.find_element(By.CSS_SELECTOR,
+                            '.user-name, .nickname, [class*="author"], [class*="name"]')
+                        text_el = elem.find_element(By.CSS_SELECTOR,
+                            '.content, .text, [class*="content"]')
+                        if author_el and text_el:
+                            comments_list.append({
+                                "author": author_el.text.strip(),
+                                "text": text_el.text.strip()
+                            })
+                    except:
+                        pass
+                if comments_list:
+                    logger.info(f"DOM에서 댓글 {len(comments_list)}개 추출")
+            except Exception as e:
+                logger.debug(f"DOM 댓글 추출 실패: {e}")
+
+        return comments_list
+
+    def _fetch_note_via_internal_api(self, note_id: str) -> Optional[Dict[str, Any]]:
+        """
+        XHS 내부 API를 Selenium 브라우저에서 직접 호출하여 노트 상세 데이터 가져오기
+        window._webmsxyw 함수로 서명을 생성하고 fetch로 API 호출
+
+        Returns:
+            interact_info dict 또는 None
+        """
+        if not self.driver:
+            return None
+
+        try:
+            # 브라우저에서 직접 XHS 내부 API 호출
+            api_result = self.driver.execute_script("""
+                async function fetchNoteDetail(noteId) {
+                    try {
+                        var url = '/api/sns/web/v1/feed';
+                        var data = JSON.stringify({"source_note_id": noteId});
+
+                        // 서명 생성
+                        var signs = {};
+                        if (window._webmsxyw) {
+                            signs = window._webmsxyw(url, data);
+                        }
+
+                        var headers = {
+                            'Content-Type': 'application/json',
+                            'X-S': signs['X-s'] || '',
+                            'X-T': signs['X-t'] || String(Date.now())
+                        };
+                        if (signs['X-s-common']) {
+                            headers['X-S-Common'] = signs['X-s-common'];
+                        }
+
+                        var resp = await fetch('https://edith.xiaohongshu.com' + url, {
+                            method: 'POST',
+                            headers: headers,
+                            body: data,
+                            credentials: 'include'
+                        });
+
+                        var json = await resp.json();
+                        if (json && json.data && json.data.items && json.data.items.length > 0) {
+                            var noteCard = json.data.items[0].note_card;
+                            if (noteCard) {
+                                return {
+                                    title: noteCard.title || noteCard.desc || '',
+                                    desc: noteCard.desc || '',
+                                    interact_info: noteCard.interact_info || {},
+                                    user: noteCard.user || {},
+                                    image_list: noteCard.image_list || [],
+                                    tag_list: noteCard.tag_list || []
+                                };
+                            }
+                        }
+                        return null;
+                    } catch(e) {
+                        return {error: e.toString()};
+                    }
+                }
+                return await fetchNoteDetail(arguments[0]);
+            """, note_id)
+
+            if not api_result:
+                logger.info("내부 API: 응답 없음")
+                return None
+
+            if api_result.get('error'):
+                logger.warning(f"내부 API 오류: {api_result['error']}")
+                return None
+
+            logger.info(f"내부 API 성공: interact_info keys={list(api_result.get('interact_info', {}).keys())}")
+            return api_result
+
+        except Exception as e:
+            logger.warning(f"내부 API 호출 실패: {e}")
+            # 디버그: _webmsxyw 존재 여부 확인
+            try:
+                has_sign = self.driver.execute_script("return typeof window._webmsxyw")
+                logger.info(f"_webmsxyw 타입: {has_sign}")
+            except:
+                pass
+            return None
+
+    def _fetch_comments_via_api(self, note_id: str) -> list:
+        """
+        XHS 내부 API로 댓글 목록 가져오기
+        """
+        if not self.driver:
+            return []
+
+        try:
+            comments = self.driver.execute_script("""
+                async function fetchComments(noteId) {
+                    try {
+                        var url = '/api/sns/web/v2/comment/page?note_id=' + noteId + '&cursor=&top_comment_id=&image_formats=jpg,webp,avif';
+
+                        var signs = {};
+                        if (window._webmsxyw) {
+                            signs = window._webmsxyw(url, undefined);
+                        }
+
+                        var headers = {
+                            'X-S': signs['X-s'] || '',
+                            'X-T': signs['X-t'] || String(Date.now())
+                        };
+                        if (signs['X-s-common']) {
+                            headers['X-S-Common'] = signs['X-s-common'];
+                        }
+
+                        var resp = await fetch('https://edith.xiaohongshu.com' + url, {
+                            method: 'GET',
+                            headers: headers,
+                            credentials: 'include'
+                        });
+
+                        var json = await resp.json();
+                        var result = [];
+                        if (json && json.data && json.data.comments) {
+                            var comments = json.data.comments;
+                            for (var i = 0; i < Math.min(comments.length, 10); i++) {
+                                var c = comments[i];
+                                result.push({
+                                    author: (c.user_info && c.user_info.nickname) || '익명',
+                                    text: c.content || '',
+                                    likes: parseInt(c.like_count) || 0
+                                });
+                            }
+                        }
+                        return result;
+                    } catch(e) {
+                        return [];
+                    }
+                }
+                return await fetchComments(arguments[0]);
+            """, note_id)
+
+            if comments:
+                logger.info(f"내부 API 댓글 {len(comments)}개 수집")
+            return comments or []
+
+        except Exception as e:
+            logger.warning(f"댓글 API 호출 실패: {e}")
+            return []
+
     def _extract_post_data(self, url: str) -> dict:
         """
-        게시물 데이터 추출
+        게시물 데이터 추출 - CDP 네트워크 가로채기 + __INITIAL_STATE__ + DOM 복합 방식
 
         Args:
             url: 게시물 URL
@@ -757,65 +1232,435 @@ class XHSCrawler:
             "author": None,
             "author_id": None,
             "title": None,
+            "content": None,
             "likes": 0,
             "favorites": 0,
             "comments": 0,
             "shares": 0,
             "views": None,
+            "thumbnail": None,
+            "comments_list": [],
             "crawled_at": datetime.now().isoformat(),
         }
 
         try:
-            # 게시물 페이지 로드
+            # === 게시물 페이지 직접 로드 ===
+            logger.info(f"페이지 로드: {url}")
             self.driver.get(url)
             time.sleep(self.PAGE_LOAD_WAIT)
 
-            # 페이지가 완전히 로드될 때까지 대기
             WebDriverWait(self.driver, self.timeout).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
+            time.sleep(3)
+            logger.info(f"현재 URL: {self.driver.current_url}")
+            logger.info(f"페이지 제목: {self.driver.title}")
 
-            # 추가 대기 (동적 콘텐츠 로드)
-            time.sleep(2)
-
-            # === 먼저 JavaScript로 __INITIAL_STATE__ 데이터 추출 시도 ===
+            # === DOM 구조 덤프 (디버그) ===
             try:
-                page_data = self.driver.execute_script("""
-                    if (window.__INITIAL_STATE__) {
-                        return JSON.stringify(window.__INITIAL_STATE__);
+                dom_dump = self.driver.execute_script("""
+                    // 페이지의 주요 구조 덤프
+                    var result = {};
+                    result.url = window.location.href;
+                    result.title = document.title;
+
+                    // body의 직속 자식 요소들
+                    var bodyChildren = [];
+                    for (var i = 0; i < document.body.children.length && i < 10; i++) {
+                        var el = document.body.children[i];
+                        var cn = (typeof el.className === 'string') ? el.className : '';
+                        bodyChildren.push(el.tagName + '.' + cn.substring(0, 80) + '#' + (el.id || ''));
                     }
-                    return null;
+                    result.body_children = bodyChildren;
+
+                    // 모든 class에 'detail', 'modal', 'engage', 'interact', 'like', 'comment' 포함된 요소
+                    var keywords = ['detail', 'modal', 'engage', 'interact', 'comment', 'collect'];
+                    var found = {};
+                    keywords.forEach(function(kw) {
+                        var els = document.querySelectorAll('[class*="' + kw + '"]');
+                        found[kw] = [];
+                        for (var j = 0; j < els.length && j < 5; j++) {
+                            var cn2 = (typeof els[j].className === 'string') ? els[j].className : '';
+                            found[kw].push(els[j].tagName + '.' + cn2.substring(0, 100));
+                        }
+                    });
+                    result.keyword_elements = found;
+
+                    // engage/interact 영역의 자식 텍스트
+                    var engageEls = document.querySelectorAll('[class*="engage"], [class*="interact"]');
+                    result.engage_texts = [];
+                    for (var k = 0; k < engageEls.length && k < 3; k++) {
+                        var cn3 = (typeof engageEls[k].className === 'string') ? engageEls[k].className : '';
+                        result.engage_texts.push({
+                            class: cn3.substring(0, 80),
+                            text: engageEls[k].textContent.substring(0, 200)
+                        });
+                    }
+
+                    return result;
+                """)
+                if dom_dump:
+                    logger.info(f"DOM 덤프 - URL: {dom_dump.get('url')}")
+                    logger.info(f"DOM 덤프 - title: {dom_dump.get('title')}")
+                    logger.info(f"DOM 덤프 - body_children: {dom_dump.get('body_children')}")
+                    for kw, els in (dom_dump.get('keyword_elements') or {}).items():
+                        if els:
+                            logger.info(f"DOM 덤프 - [{kw}]: {els}")
+                    for et in (dom_dump.get('engage_texts') or []):
+                        logger.info(f"DOM 덤프 - engage text: class={et.get('class')}, text={et.get('text')}")
+            except Exception as e:
+                logger.warning(f"DOM 덤프 실패: {e}")
+
+            # === 방법 1: performance log에서 XHS API 응답 캡처 ===
+            api_data_found = False
+            try:
+                # XHR/fetch 응답 데이터를 JavaScript로 직접 캡처
+                api_capture = self.driver.execute_script("""
+                    // window.__INITIAL_STATE__에서 먼저 시도
+                    if (window.__INITIAL_STATE__) {
+                        var state = window.__INITIAL_STATE__;
+                        var noteState = state.note || {};
+                        var noteDetailMap = noteState.noteDetailMap || noteState.noteFetching || {};
+
+                        // noteDetailMap에서 데이터 찾기
+                        var keys = Object.keys(noteDetailMap);
+                        for (var i = 0; i < keys.length; i++) {
+                            var entry = noteDetailMap[keys[i]];
+                            if (entry && entry.note) {
+                                var note = entry.note;
+                                var interact = note.interactInfo || {};
+                                return {
+                                    source: 'INITIAL_STATE',
+                                    title: note.title || '',
+                                    desc: note.desc || '',
+                                    likes: parseInt(interact.likedCount) || 0,
+                                    favorites: parseInt(interact.collectedCount) || 0,
+                                    comments: parseInt(interact.commentCount) || 0,
+                                    shares: parseInt(interact.shareCount) || 0,
+                                    author: (note.user && note.user.nickname) || '',
+                                    author_id: (note.user && (note.user.userId || note.user.uid)) || '',
+                                    thumbnail: (note.imageList && note.imageList[0] && (note.imageList[0].urlDefault || note.imageList[0].url)) || '',
+                                    all_interact_keys: Object.keys(interact),
+                                    all_note_keys: Object.keys(note).slice(0, 20)
+                                };
+                            }
+                        }
+
+                        // 구버전 구조
+                        if (noteState.note) {
+                            var note2 = noteState.note;
+                            var interact2 = note2.interactInfo || {};
+                            return {
+                                source: 'INITIAL_STATE_legacy',
+                                title: note2.title || '',
+                                desc: note2.desc || '',
+                                likes: parseInt(interact2.likedCount) || parseInt(note2.likedCount) || 0,
+                                favorites: parseInt(interact2.collectedCount) || parseInt(note2.collectedCount) || 0,
+                                comments: parseInt(interact2.commentCount) || parseInt(note2.commentCount) || 0,
+                                shares: parseInt(interact2.shareCount) || parseInt(note2.shareCount) || 0,
+                                author: (note2.user && note2.user.nickname) || '',
+                                author_id: (note2.user && note2.user.userId) || '',
+                                thumbnail: (note2.imageList && note2.imageList[0] && (note2.imageList[0].urlDefault || note2.imageList[0].url)) || '',
+                                all_interact_keys: Object.keys(interact2),
+                                all_note_keys: Object.keys(note2).slice(0, 20)
+                            };
+                        }
+
+                        // 디버깅: state 구조 출력
+                        return {
+                            source: 'DEBUG',
+                            state_keys: Object.keys(state).slice(0, 10),
+                            note_keys: Object.keys(noteState).slice(0, 10),
+                            noteDetailMap_keys: keys.slice(0, 5),
+                            has_note: !!noteState.note
+                        };
+                    }
+                    return {source: 'NO_STATE'};
                 """)
 
-                if page_data:
-                    # __INITIAL_STATE__에서 데이터 추출
-                    html_result = self._extract_data_from_html(page_data, url, note_id or "")
-                    if html_result and (html_result.get('likes', 0) > 0 or html_result.get('author')):
-                        logger.info(f"JavaScript __INITIAL_STATE__에서 데이터 추출 성공")
-                        return html_result
+                if api_capture:
+                    print(f"[XHS] API 캡처 결과: source={api_capture.get('source')}")
+
+                    if api_capture.get('source') == 'DEBUG':
+                        print(f"[XHS] DEBUG - state_keys: {api_capture.get('state_keys')}")
+                        print(f"[XHS] DEBUG - note_keys: {api_capture.get('note_keys')}")
+                        print(f"[XHS] DEBUG - noteDetailMap_keys: {api_capture.get('noteDetailMap_keys')}")
+
+                    elif api_capture.get('source') == 'NO_STATE':
+                        print("[XHS] __INITIAL_STATE__ 없음")
+
+                    else:
+                        # 데이터 추출 성공
+                        logger.info(f"  interact_keys: {api_capture.get('all_interact_keys')}")
+                        logger.info(f"  note_keys: {api_capture.get('all_note_keys')}")
+
+                        if api_capture.get('title'):
+                            result['title'] = api_capture['title']
+                        if api_capture.get('desc') and not result.get('content'):
+                            result['content'] = api_capture['desc']
+                            if not result.get('title'):
+                                result['title'] = api_capture['desc'][:100]
+                        if api_capture.get('likes', 0) > 0:
+                            result['likes'] = api_capture['likes']
+                        if api_capture.get('favorites', 0) > 0:
+                            result['favorites'] = api_capture['favorites']
+                        if api_capture.get('comments', 0) > 0:
+                            result['comments'] = api_capture['comments']
+                        if api_capture.get('shares', 0) > 0:
+                            result['shares'] = api_capture['shares']
+                        if api_capture.get('author'):
+                            result['author'] = api_capture['author']
+                        if api_capture.get('author_id'):
+                            result['author_id'] = api_capture['author_id']
+                        if api_capture.get('thumbnail'):
+                            thumb = api_capture['thumbnail']
+                            if '\\u002F' in thumb:
+                                thumb = thumb.encode().decode('unicode_escape')
+                            result['thumbnail'] = thumb
+
+                        api_data_found = (result['likes'] > 0 or result.get('author'))
+                        logger.info(f"캡처 최종: likes={result['likes']}, comments={result['comments']}, favorites={result['favorites']}, shares={result['shares']}, author={result.get('author', '')}")
 
             except Exception as e:
-                logger.debug(f"JavaScript __INITIAL_STATE__ 추출 실패: {e}")
+                logger.warning(f"API 캡처 실패: {e}")
 
-            # === 페이지 소스에서 데이터 추출 시도 ===
-            try:
-                page_source = self.driver.page_source
-                html_result = self._extract_data_from_html(page_source, url, note_id or "")
-                if html_result and (html_result.get('likes', 0) > 0 or html_result.get('author')):
-                    logger.info(f"페이지 소스에서 데이터 추출 성공")
-                    return html_result
-            except Exception as e:
-                logger.debug(f"페이지 소스 추출 실패: {e}")
+            # === 방법 2: HTML 소스에서 정규식 추출 (fallback) ===
+            if not api_data_found:
+                try:
+                    page_source = self.driver.page_source
+                    html_result = self._extract_data_from_html(page_source, url, note_id or "")
+                    if html_result:
+                        result.update(html_result)
+                        logger.info(f"HTML 추출: likes={result['likes']}, comments={result['comments']}")
+                except Exception as e:
+                    logger.debug(f"HTML 추출 실패: {e}")
 
-            # === DOM 셀렉터 방식 (백업) ===
+            # === 내부 API로 부족한 데이터 보충 ===
+            if note_id and (result['comments'] == 0 or result['favorites'] == 0 or result['shares'] == 0):
+                logger.info("내부 API로 댓글/저장/공유 수 보충 시도...")
+                api_data = self._fetch_note_via_internal_api(note_id)
+                if api_data and not api_data.get('error'):
+                    interact = api_data.get('interact_info', {})
+                    if interact:
+                        api_likes = int(interact.get('liked_count') or 0)
+                        api_comments = int(interact.get('comment_count') or 0)
+                        api_favorites = int(interact.get('collected_count') or 0)
+                        api_shares = int(interact.get('share_count') or 0)
+                        logger.info(f"내부 API 데이터: likes={api_likes}, comments={api_comments}, favorites={api_favorites}, shares={api_shares}")
+                        if api_likes > 0 and result['likes'] == 0:
+                            result['likes'] = api_likes
+                        if api_comments > 0:
+                            result['comments'] = api_comments
+                        if api_favorites > 0:
+                            result['favorites'] = api_favorites
+                        if api_shares > 0:
+                            result['shares'] = api_shares
+                    # 작성자 보충
+                    user = api_data.get('user', {})
+                    if user and not result.get('author'):
+                        result['author'] = user.get('nickname') or user.get('name')
+                    # 제목 보충
+                    if not result.get('title') and api_data.get('title'):
+                        result['title'] = api_data['title']
+
+                # 댓글 수집
+                if self.collect_comments and not result.get('comments_list'):
+                    logger.info("내부 API로 댓글 목록 수집 시도...")
+                    result['comments_list'] = self._fetch_comments_via_api(note_id)
+
+            # DOM에서 댓글 수집 (API 실패 시 fallback)
+            if self.collect_comments and not result.get('comments_list'):
+                logger.info("DOM에서 댓글 수집 시도...")
+                try:
+                    dom_comments = self.driver.execute_script("""
+                        var comments = [];
+                        var seen = {};
+                        // comment-item만 선택 (parent-comment은 중복 포함)
+                        var items = document.querySelectorAll('.comment-item');
+                        if (items.length === 0) items = document.querySelectorAll('[class*="comment-item"]');
+                        for (var i = 0; i < items.length && comments.length < arguments[0]; i++) {
+                            var item = items[i];
+                            var authorEl = item.querySelector('.author-wrapper .name, .user-name, .nickname, [class*="name"]');
+                            var contentEl = item.querySelector('.note-text, .content, [class*="content"]');
+                            if (authorEl && contentEl) {
+                                var key = authorEl.textContent.trim() + '|' + contentEl.textContent.trim();
+                                if (!seen[key]) {
+                                    seen[key] = true;
+                                    comments.push({
+                                        author: authorEl.textContent.trim(),
+                                        text: contentEl.textContent.trim()
+                                    });
+                                }
+                            }
+                        }
+                        return comments;
+                    """, self.max_comments)
+                    if dom_comments:
+                        result['comments_list'] = dom_comments
+                        logger.info(f"DOM에서 댓글 {len(dom_comments)}개 수집")
+                    else:
+                        logger.info("DOM 댓글 없음")
+                except Exception as e:
+                    logger.warning(f"DOM 댓글 수집 실패: {e}")
+
+            # === DOM 셀렉터 방식 (추가 보충) ===
+            need_dom = (result['comments'] == 0 or result['favorites'] == 0
+                        or not result.get('thumbnail') or not result.get('author'))
+            if need_dom:
+                logger.info("DOM 셀렉터로 부족한 데이터 보충 시도...")
+
+            # === 최신 XHS: 모달/상세 영역 내 engage-bar에서 숫자 수집 ===
+            if result['comments'] == 0 or result['favorites'] == 0 or result['shares'] == 0:
+                try:
+                    engage_data = self.driver.execute_script("""
+                        var r = {likes: '', favorites: '', comments: '', shares: ''};
+
+                        // 모달 또는 상세 컨테이너 찾기 (피드가 아닌 현재 게시물)
+                        var modal = document.querySelector(
+                            '.note-detail-mask, .note-detail, #noteContainer, ' +
+                            '[class*="note-detail"], [class*="detail-container"], ' +
+                            '.overlay-container, .modal-container'
+                        );
+                        var scope = modal || document;
+
+                        // 방법1: like-wrapper, collect-wrapper, chat-wrapper, share-wrapper 순서
+                        var likeW = scope.querySelector('[class*="like-wrapper"], [class*="like-active"], [class*="like "]');
+                        var collectW = scope.querySelector('[class*="collect-wrapper"], [class*="collect-active"], [class*="collect "]');
+                        var chatW = scope.querySelector('[class*="chat-wrapper"], [class*="comment-wrapper"], [class*="chat "]');
+                        var shareW = scope.querySelector('[class*="share-wrapper"], [class*="share "]');
+
+                        function getCount(el) {
+                            if (!el) return '';
+                            var spans = el.querySelectorAll('span');
+                            for (var i = 0; i < spans.length; i++) {
+                                var t = spans[i].textContent.trim();
+                                if (/^[\\d.]+[万wk亿]?$/i.test(t)) return t;
+                            }
+                            // 직접 텍스트에서
+                            var m = el.textContent.match(/[\\d.]+[万wk亿]?/i);
+                            return m ? m[0] : '';
+                        }
+
+                        r.likes = getCount(likeW);
+                        r.favorites = getCount(collectW);
+                        r.comments = getCount(chatW);
+                        r.shares = getCount(shareW);
+
+                        // 방법2: engage-bar 내 순서대로 (fallback)
+                        if (!r.likes && !r.favorites) {
+                            var bar = scope.querySelector('[class*="engage-bar"], [class*="interact-container"]');
+                            if (bar) {
+                                var items = bar.querySelectorAll('[class*="wrapper"], [class*="item"]');
+                                var counts = [];
+                                items.forEach(function(item) {
+                                    var m = item.textContent.match(/[\\d.]+[万wk亿]?/i);
+                                    if (m) counts.push(m[0]);
+                                });
+                                if (counts.length >= 1 && !r.likes) r.likes = counts[0];
+                                if (counts.length >= 2 && !r.favorites) r.favorites = counts[1];
+                                if (counts.length >= 3 && !r.comments) r.comments = counts[2];
+                                if (counts.length >= 4 && !r.shares) r.shares = counts[3];
+                            }
+                        }
+
+                        r.modal_found = !!modal;
+                        r.scope_tag = scope.tagName + '.' + (scope.className || '').substring(0, 50);
+                        return r;
+                    """)
+                    if engage_data:
+                        logger.info(f"DOM engage 데이터: {engage_data}")
+                        if engage_data.get('likes') and result['likes'] == 0:
+                            result['likes'] = self._parse_count(engage_data['likes'])
+                        if engage_data.get('favorites') and result['favorites'] == 0:
+                            result['favorites'] = self._parse_count(engage_data['favorites'])
+                        if engage_data.get('comments') and result['comments'] == 0:
+                            result['comments'] = self._parse_count(engage_data['comments'])
+                        if engage_data.get('shares') and result['shares'] == 0:
+                            result['shares'] = self._parse_count(engage_data['shares'])
+                except Exception as e:
+                    logger.debug(f"DOM engage 추출 실패: {e}")
+
+            # === 최신 XHS: 전체 페이지 텍스트에서 숫자 패턴 추출 ===
+            if result['comments'] == 0 or result['favorites'] == 0:
+                try:
+                    dom_data = self.driver.execute_script("""
+                        var r = {};
+                        // XHS 2024+ 구조: data-* 속성이나 aria-label에 숫자 정보
+                        var btns = document.querySelectorAll('button, [role="button"], .operation-btn, [class*="btn"]');
+                        btns.forEach(function(btn) {
+                            var label = btn.getAttribute('aria-label') || btn.getAttribute('data-label') || '';
+                            var text = btn.textContent.trim();
+                            if (/赞|like/i.test(label) || /赞|like/i.test(btn.className)) {
+                                var m = text.match(/[\\d.]+[万wk亿]?/i);
+                                if (m) r.likes = m[0];
+                            }
+                            if (/收藏|collect|star/i.test(label) || /collect|star/i.test(btn.className)) {
+                                var m = text.match(/[\\d.]+[万wk亿]?/i);
+                                if (m) r.favorites = m[0];
+                            }
+                            if (/评论|comment|chat/i.test(label) || /comment|chat/i.test(btn.className)) {
+                                var m = text.match(/[\\d.]+[万wk亿]?/i);
+                                if (m) r.comments = m[0];
+                            }
+                            if (/分享|share/i.test(label) || /share/i.test(btn.className)) {
+                                var m = text.match(/[\\d.]+[万wk亿]?/i);
+                                if (m) r.shares = m[0];
+                            }
+                        });
+                        return r;
+                    """)
+                    if dom_data:
+                        logger.info(f"DOM 버튼 데이터: {dom_data}")
+                        if dom_data.get('likes') and result['likes'] == 0:
+                            result['likes'] = self._parse_count(dom_data['likes'])
+                        if dom_data.get('favorites') and result['favorites'] == 0:
+                            result['favorites'] = self._parse_count(dom_data['favorites'])
+                        if dom_data.get('comments') and result['comments'] == 0:
+                            result['comments'] = self._parse_count(dom_data['comments'])
+                        if dom_data.get('shares') and result['shares'] == 0:
+                            result['shares'] = self._parse_count(dom_data['shares'])
+                except Exception as e:
+                    logger.debug(f"DOM 버튼 데이터 추출 실패: {e}")
+
+            # === 썸네일 추출 (DOM) ===
+            thumbnail_selectors = [
+                # 실제 콘텐츠 이미지 우선
+                "//div[contains(@class, 'swiper-slide')]//img[contains(@src, 'sns-')]",
+                "//div[contains(@class, 'carousel')]//img[contains(@src, 'sns-')]",
+                "//div[contains(@class, 'media')]//img[contains(@src, 'sns-')]",
+                "//img[contains(@src, 'sns-webpic')]",
+                "//img[contains(@src, 'sns-img')]",
+                # 일반 이미지 (fallback)
+                "//div[contains(@class, 'swiper-slide')]//img",
+                "//div[contains(@class, 'carousel')]//img",
+                "//div[contains(@class, 'media')]//img",
+                "//div[contains(@class, 'note')]//img[contains(@class, 'image')]",
+            ]
+            for selector in thumbnail_selectors:
+                try:
+                    img_elem = self.driver.find_element(By.XPATH, selector)
+                    src = img_elem.get_attribute('src')
+                    # 정적 자산 제외, 실제 콘텐츠 이미지만
+                    if src and 'fe-static' not in src and ('xhscdn' in src or 'xiaohongshu' in src):
+                        result["thumbnail"] = src
+                        logger.info(f"DOM에서 썸네일 추출: {src[:50]}...")
+                        break
+                except NoSuchElementException:
+                    continue
+
             # === 작성자 정보 (최신 샤오홍슈 구조) ===
             author_selectors = [
-                # 최신 구조
+                # 모달/상세 페이지 구조
+                "//a[contains(@href, '/user/profile')]//span[contains(@class, 'name')]",
+                "//div[contains(@class, 'author-container')]//span[contains(@class, 'name')]",
                 "//div[contains(@class, 'author-wrapper')]//span[contains(@class, 'username')]",
                 "//a[contains(@class, 'author')]//span[contains(@class, 'name')]",
+                # 프로필 링크 내 이름
+                "//a[contains(@href, '/user/profile')]//div[contains(@class, 'name')]",
+                "//a[contains(@href, '/user/profile')]/span",
+                # 일반 구조
                 "//div[contains(@class, 'note-top')]//a[contains(@class, 'author')]",
                 "//div[contains(@class, 'info')]//a[contains(@class, 'name')]",
-                # 구버전 구조
                 "//a[contains(@class, 'author')]//span",
                 "//div[contains(@class, 'author')]//span[@class='username']",
                 "//span[contains(@class, 'user-name')]",
@@ -833,21 +1678,47 @@ class XHSCrawler:
                     continue
 
             # === 제목 (최신 구조) ===
+            # 플레이스홀더 텍스트 리스트
+            placeholder_texts = ["还没有简介", "暂无简介", "没有描述", "暂无描述", "暂无内容"]
+
             title_selectors = [
                 "//div[@id='detail-title']",
                 "//div[contains(@class, 'title')]//span",
                 "//div[contains(@class, 'note-content')]//div[contains(@class, 'title')]",
-                "//div[contains(@class, 'desc')]",
                 "//h1",
             ]
             for selector in title_selectors:
                 try:
                     title_elem = self.driver.find_element(By.XPATH, selector)
                     text = title_elem.text.strip()
-                    # 기본 페이지 제목이 아닌지 확인
+                    # 기본 페이지 제목/플레이스홀더가 아닌지 확인
                     if text and not text.startswith("小红书") and "沪ICP" not in text:
-                        result["title"] = text[:100]
-                        break
+                        if text not in placeholder_texts:
+                            result["title"] = text[:100]
+                            break
+                except NoSuchElementException:
+                    continue
+
+            # === 본문 내용 (content) ===
+            content_selectors = [
+                "//div[@id='detail-desc']",
+                "//div[contains(@class, 'desc')]//span[@class='desc']",
+                "//div[contains(@class, 'note-content')]//div[contains(@class, 'desc')]",
+                "//div[contains(@class, 'note-scroller')]//span[contains(@class, 'desc')]",
+                "//span[contains(@class, 'note-text')]",
+            ]
+            for selector in content_selectors:
+                try:
+                    content_elem = self.driver.find_element(By.XPATH, selector)
+                    text = content_elem.text.strip()
+                    # 플레이스홀더가 아닌 실제 콘텐츠인지 확인
+                    if text and len(text) > 5 and not text.startswith("小红书") and "沪ICP" not in text:
+                        if text not in placeholder_texts:
+                            result["content"] = text[:500]
+                            # title이 없으면 content 첫 부분을 title로 사용
+                            if not result.get("title"):
+                                result["title"] = text[:100]
+                            break
                 except NoSuchElementException:
                     continue
 
@@ -1035,10 +1906,10 @@ class XHSCrawler:
                             note = value.get('note', {})
                             interact_info = note.get('interactInfo', {})
                             if interact_info:
-                                result['likes'] = int(interact_info.get('likedCount', 0) or 0)
-                                result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
-                                result['comments'] = int(interact_info.get('commentCount', 0) or 0)
-                                result['shares'] = int(interact_info.get('shareCount', 0) or 0)
+                                result['likes'] = parse_chinese_number(interact_info.get('likedCount', 0))
+                                result['favorites'] = parse_chinese_number(interact_info.get('collectedCount', 0))
+                                result['comments'] = parse_chinese_number(interact_info.get('commentCount', 0))
+                                result['shares'] = parse_chinese_number(interact_info.get('shareCount', 0))
 
                             user = note.get('user', {})
                             if user:
@@ -1052,10 +1923,10 @@ class XHSCrawler:
                 if 'interactInfo' in str(data):
                     interact_info = data.get('interactInfo', {})
                     if interact_info:
-                        result['likes'] = int(interact_info.get('likedCount', 0) or 0)
-                        result['favorites'] = int(interact_info.get('collectedCount', 0) or 0)
-                        result['comments'] = int(interact_info.get('commentCount', 0) or 0)
-                        result['shares'] = int(interact_info.get('shareCount', 0) or 0)
+                        result['likes'] = parse_chinese_number(interact_info.get('likedCount', 0))
+                        result['favorites'] = parse_chinese_number(interact_info.get('collectedCount', 0))
+                        result['comments'] = parse_chinese_number(interact_info.get('commentCount', 0))
+                        result['shares'] = parse_chinese_number(interact_info.get('shareCount', 0))
                         return
 
             # 문자열에서 정규식으로 추출

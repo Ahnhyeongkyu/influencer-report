@@ -22,6 +22,50 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
+
+def decode_unicode_escapes(text: str) -> str:
+    """유니코드 이스케이프 시퀀스를 디코딩 (\\uXXXX -> 실제 문자)
+
+    이모지 등 surrogate pair도 올바르게 처리합니다.
+    UTF-8이 Latin-1로 잘못 해석된 경우도 수정합니다.
+    """
+    if not text:
+        return text
+    try:
+        # 1단계: UTF-8이 Latin-1로 잘못 해석된 경우 수정 시도
+        # 예: "ç¬¬ä¸æ¬¡è¦ç¶²å" -> "第一次覺網友" (중국어/대만어)
+        try:
+            fixed = text.encode('latin-1').decode('utf-8')
+            if fixed != text:
+                # Latin-1 수정 성공 - 기본 이스케이프만 처리하고 반환
+                fixed = fixed.replace('\\n', '\n').replace('\\r', '\r')
+                fixed = fixed.replace('\\t', '\t').replace('\\"', '"')
+                fixed = fixed.replace('\\/', '/')
+                return fixed
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass  # Latin-1 수정 불가, 다음 단계로
+
+        # 2단계: \uXXXX 패턴이 있는 경우 re.sub으로 안전하게 변환
+        # (unicode_escape 코덱 대신 re.sub 사용 - 중국어+이스케이프 혼합 텍스트에서도 안전)
+        if '\\u' in text:
+            def replace_unicode(match):
+                return chr(int(match.group(1), 16))
+            decoded = re.sub(r'\\u([0-9a-fA-F]{4})', replace_unicode, text)
+            try:
+                decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
+            except:
+                pass
+        else:
+            decoded = text
+
+        # 기타 이스케이프 시퀀스 처리
+        decoded = decoded.replace('\\n', '\n').replace('\\r', '\r')
+        decoded = decoded.replace('\\t', '\t').replace('\\"', '"')
+        decoded = decoded.replace('\\/', '/')
+        return decoded
+    except Exception:
+        return text
+
 # cloudscraper25 for Cloudflare v2/v3 bypass (enhanced fork)
 try:
     import cloudscraper25 as cloudscraper
@@ -35,6 +79,14 @@ except ImportError:
     except ImportError:
         HAS_CLOUDSCRAPER = False
         CLOUDSCRAPER_VERSION = None
+
+# nodriver for Cloudflare bypass (2025 recommended)
+try:
+    import nodriver
+    import asyncio
+    HAS_NODRIVER = True
+except ImportError:
+    HAS_NODRIVER = False
 
 # Streamlit Cloud 환경 감지
 IS_CLOUD = platform.system() == "Linux" and os.path.exists("/etc/debian_version")
@@ -109,6 +161,8 @@ class DcardCrawler:
         timeout: int = DEFAULT_TIMEOUT,
         cookie_file: Optional[str] = None,
         use_api: bool = True,  # API 방식 우선 사용
+        collect_comments: bool = True,  # 댓글 내용 수집 여부
+        max_comments: int = 10,  # 수집할 최대 댓글 수
     ):
         """
         크롤러 초기화
@@ -118,11 +172,15 @@ class DcardCrawler:
             timeout: 기본 타임아웃 (초)
             cookie_file: 쿠키 저장 파일 경로
             use_api: API 방식 우선 사용 여부
+            collect_comments: 댓글 내용 수집 여부
+            max_comments: 수집할 최대 댓글 수
         """
         self.headless = headless
         self.timeout = timeout
         self.cookie_file = Path(cookie_file) if cookie_file else self.COOKIE_FILE
         self.use_api = use_api
+        self.collect_comments = collect_comments
+        self.max_comments = max_comments
 
         self.driver = None
         self.scraper = None  # cloudscraper 인스턴스
@@ -173,10 +231,102 @@ class DcardCrawler:
                 'Sec-Fetch-Mode': 'cors',
                 'Sec-Fetch-Site': 'same-origin',
             })
+
+            # 저장된 쿠키 로드하여 cloudscraper에 적용 (cf_clearance 등)
+            self._load_cookies_to_scraper()
+
             logger.info(f"cloudscraper 초기화 완료 (version={CLOUDSCRAPER_VERSION})")
         except Exception as e:
             logger.warning(f"cloudscraper 초기화 실패: {e}")
             self.scraper = None
+
+    def _fetch_comments(self, post_id: str) -> List[Dict[str, Any]]:
+        """
+        Dcard API를 통해 댓글 수집
+
+        Args:
+            post_id: 게시물 ID
+
+        Returns:
+            댓글 리스트 (author, text, likes 포함)
+        """
+        if not self.scraper or not self.collect_comments:
+            return []
+
+        comments_list = []
+        # 댓글 API 엔드포인트 (v2 우선, _api fallback)
+        endpoints = [
+            f"{self.API_URL}/{post_id}/comments?limit={self.max_comments}",
+            f"{self.BASE_URL}/_api/posts/{post_id}/comments?limit={self.max_comments}",
+        ]
+
+        for ep_url in endpoints:
+            try:
+                logger.info(f"Dcard 댓글 API 호출: {ep_url}")
+                response = self.scraper.get(ep_url, timeout=self.timeout)
+                response.encoding = 'utf-8'  # UTF-8 강제
+
+                if response.status_code == 200:
+                    comments_data = response.json()
+                    for comment in comments_data[:self.max_comments]:
+                        raw_content = comment.get("content", "")
+                        comment_item = {
+                            "author": comment.get("school") or "익명",
+                            "text": decode_unicode_escapes(raw_content) if raw_content else "",
+                            "likes": comment.get("likeCount", 0) or 0,
+                        }
+                        if comment_item["text"]:  # 빈 댓글 제외
+                            comments_list.append(comment_item)
+                    if comments_list:
+                        logger.info(f"Dcard 댓글 {len(comments_list)}개 수집됨 ({ep_url})")
+                        break  # 성공하면 루프 종료
+                    else:
+                        logger.info(f"Dcard 댓글 API 응답 200이지만 댓글 없음 ({ep_url})")
+                else:
+                    logger.warning(f"Dcard 댓글 API 실패: {response.status_code} ({ep_url})")
+
+            except Exception as e:
+                logger.warning(f"Dcard 댓글 수집 실패: {e} ({ep_url})")
+
+        return comments_list
+
+    def _load_cookies_to_scraper(self) -> bool:
+        """저장된 쿠키를 cloudscraper 세션에 로드"""
+        if not self.scraper or not self.cookie_file.exists():
+            return False
+
+        try:
+            with open(self.cookie_file, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+
+            # 중요 쿠키들을 cloudscraper 세션에 추가
+            important_cookies = ['cf_clearance', '__cf_bm', '_cfuvid', 'NID', 'dcsrd']
+            loaded_count = 0
+
+            for cookie in cookies:
+                name = cookie.get('name', '')
+                value = cookie.get('value', '')
+                domain = cookie.get('domain', '')
+
+                # 중요 쿠키만 로드 (Cloudflare 관련)
+                if name in important_cookies or name.startswith('cf_') or name.startswith('__cf'):
+                    # requests 쿠키 형식으로 변환
+                    self.scraper.cookies.set(
+                        name=name,
+                        value=value,
+                        domain=domain.lstrip('.') if domain.startswith('.') else domain,
+                        path=cookie.get('path', '/')
+                    )
+                    loaded_count += 1
+
+            if loaded_count > 0:
+                logger.info(f"cloudscraper에 {loaded_count}개 쿠키 로드 완료")
+                return True
+            return False
+
+        except Exception as e:
+            logger.debug(f"cloudscraper 쿠키 로드 실패: {e}")
+            return False
 
     def _crawl_via_api(self, post_id: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
         """
@@ -204,24 +354,42 @@ class DcardCrawler:
 
                 logger.info(f"Dcard API 호출: {api_url}")
                 response = self.scraper.get(api_url, timeout=self.timeout)
+                response.encoding = 'utf-8'  # UTF-8 강제 (Latin-1 기본값 방지)
 
                 if response.status_code == 200:
                     data = response.json()
+                    # content 우선, 없으면 excerpt 사용
+                    raw_content = data.get("content", "") or data.get("excerpt", "")
+                    raw_title = data.get("title", "")
+
+                    # 썸네일 추출 (media 배열에서 첫 번째 이미지)
+                    thumbnail = None
+                    media_list = data.get("media", []) or data.get("mediaMeta", [])
+                    if media_list and len(media_list) > 0:
+                        first_media = media_list[0]
+                        thumbnail = first_media.get("url") or first_media.get("thumbnail")
+
+                    # 댓글 내용 수집
+                    comments_list = self._fetch_comments(post_id)
+
                     result = {
                         "platform": "dcard",
                         "url": f"{self.BASE_URL}/f/{data.get('forumAlias', 'all')}/p/{post_id}",
                         "post_id": str(post_id),
                         "author": data.get("school") or "Anonymous",
-                        "title": data.get("title", ""),
+                        "title": decode_unicode_escapes(raw_title),
+                        "content": decode_unicode_escapes(raw_content),  # 게시물 본문 (유니코드 디코딩)
                         "likes": data.get("likeCount", 0) or 0,
                         "comments": data.get("commentCount", 0) or 0,
                         "shares": data.get("shareCount"),
                         "views": data.get("viewCount"),
                         "forum": data.get("forumAlias", ""),
                         "created_at": data.get("createdAt", ""),
+                        "thumbnail": thumbnail,
+                        "comments_list": comments_list,  # 댓글 내용 리스트
                         "crawled_at": datetime.now().isoformat(),
                     }
-                    logger.info(f"API 크롤링 성공: likes={result['likes']}, comments={result['comments']}")
+                    logger.info(f"API 크롤링 성공: likes={result['likes']}, comments={result['comments']}, 댓글내용={len(comments_list)}개")
                     return result
 
                 elif response.status_code == 404:
@@ -247,6 +415,491 @@ class DcardCrawler:
                 logger.warning(f"API 크롤링 시도 {attempt + 1} 실패: {e}")
                 if attempt == max_retries - 1:
                     logger.error(f"API 크롤링 최종 실패: {e}")
+
+        return None
+
+    def _crawl_via_nodriver(self, url: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
+        """
+        nodriver를 사용한 Cloudflare 우회 크롤링 (2025 권장 방식)
+
+        Args:
+            url: 게시물 URL
+            max_retries: 최대 재시도 횟수
+
+        Returns:
+            게시물 데이터 또는 None (실패 시)
+        """
+        if not HAS_NODRIVER:
+            logger.warning("nodriver가 설치되지 않음")
+            return None
+
+        async def _async_crawl():
+            browser = None
+            try:
+                print("[Dcard] nodriver로 크롤링 시도 중...")
+                print("[Dcard] 브라우저 창에서 Cloudflare 인증을 완료해주세요...")
+                logger.info("nodriver 브라우저 시작...")
+
+                browser = await nodriver.start(headless=self.headless)
+
+                # 메인 페이지 먼저 방문 (Cloudflare 통과)
+                page = await browser.get('https://www.dcard.tw/')
+
+                # === Cloudflare 수동 인증 대기 (최대 60초) ===
+                print("")
+                print("=" * 60)
+                print("[Dcard] Cloudflare 보안 인증 대기 중...")
+                print("")
+                print("  브라우저 창에서 '사람입니다' 체크박스를 클릭하거나")
+                print("  보안 인증을 완료해주세요.")
+                print("")
+                print("  대기 시간: 60초")
+                print("=" * 60)
+                print("")
+
+                cf_wait_start = time.time()
+                cf_max_wait = 60  # 60초 대기
+                cf_passed = False
+
+                while time.time() - cf_wait_start < cf_max_wait:
+                    await asyncio.sleep(2)
+
+                    try:
+                        content = await page.get_content()
+                        page_title = ""
+                        try:
+                            title_elem = await page.query_selector('title')
+                            if title_elem:
+                                page_title = await page.evaluate('document.title')
+                        except:
+                            pass
+
+                        # Cloudflare 통과 확인
+                        if "just a moment" not in content.lower() and "cloudflare" not in page_title.lower():
+                            if "dcard" in content.lower() or "__NEXT_DATA__" in content:
+                                print("[Dcard] Cloudflare 인증 성공!")
+                                cf_passed = True
+                                break
+
+                        # 진행 상황 출력 (10초마다)
+                        elapsed = int(time.time() - cf_wait_start)
+                        if elapsed % 10 == 0 and elapsed > 0:
+                            remaining = cf_max_wait - elapsed
+                            print(f"[Dcard] Cloudflare 인증 대기 중... (남은 시간: {remaining}초)")
+
+                    except Exception as e:
+                        logger.debug(f"인증 확인 중 오류 (무시): {e}")
+
+                if not cf_passed:
+                    print("[Dcard] Cloudflare 인증 시간 초과")
+                    logger.warning("nodriver: Cloudflare 인증 시간 초과")
+                    return None
+
+                # === Cloudflare 인증 후 쿠키 저장 ===
+                print("[Dcard] Cloudflare 인증 완료, 쿠키 저장 중...")
+                try:
+                    # 브라우저에서 쿠키 추출
+                    cookies_js = """
+                    (() => {
+                        return document.cookie;
+                    })()
+                    """
+                    doc_cookies = await page.evaluate(cookies_js)
+
+                    # 모든 쿠키 가져오기 (CDP 사용)
+                    all_cookies = await browser.cookies.get_all()
+                    if all_cookies:
+                        # 쿠키를 JSON 형식으로 변환하여 저장
+                        cookies_to_save = []
+                        for cookie in all_cookies:
+                            cookie_dict = {
+                                "name": cookie.name,
+                                "value": cookie.value,
+                                "domain": cookie.domain,
+                                "path": cookie.path,
+                                "secure": cookie.secure,
+                                "httpOnly": cookie.http_only if hasattr(cookie, 'http_only') else False,
+                            }
+                            if hasattr(cookie, 'expires') and cookie.expires:
+                                cookie_dict["expiry"] = int(cookie.expires)
+                            if hasattr(cookie, 'same_site') and cookie.same_site:
+                                # CookieSameSite enum을 문자열로 변환
+                                same_site_val = cookie.same_site
+                                if hasattr(same_site_val, 'value'):
+                                    cookie_dict["sameSite"] = same_site_val.value
+                                elif hasattr(same_site_val, 'name'):
+                                    cookie_dict["sameSite"] = same_site_val.name
+                                else:
+                                    cookie_dict["sameSite"] = str(same_site_val)
+                            cookies_to_save.append(cookie_dict)
+
+                        # 파일에 저장
+                        with open(self.cookie_file, "w", encoding="utf-8") as f:
+                            json.dump(cookies_to_save, f, ensure_ascii=False, indent=2)
+
+                        logger.info(f"nodriver: {len(cookies_to_save)}개 쿠키 저장 완료")
+                        print(f"[Dcard] {len(cookies_to_save)}개 쿠키 저장 완료")
+
+                        # cloudscraper에 쿠키 적용 (댓글 API 호출용)
+                        if self.scraper:
+                            self._load_cookies_to_scraper()
+                except Exception as ce:
+                    logger.warning(f"nodriver 쿠키 저장 실패: {ce}")
+                    print(f"[Dcard] 쿠키 저장 실패: {ce}")
+
+                # 인증 후 추가 대기
+                await asyncio.sleep(3)
+
+                # 게시글 페이지로 이동
+                page = await browser.get(url)
+                logger.info(f"페이지 로드 중: {url}")
+
+                # 렌더링 대기 (더 오래)
+                await asyncio.sleep(8)
+
+                # === 댓글 로딩을 위한 스크롤 및 버튼 클릭 (강화) ===
+                # 1. 먼저 더 많은 스크롤로 댓글 섹션 로드
+                for i in range(10):  # 10번 스크롤 (기존 5번)
+                    await page.scroll_down(300)
+                    await asyncio.sleep(0.8)  # 대기 시간 증가
+
+                # 2. "더 보기" 버튼 클릭 시도 (댓글 펼치기)
+                try:
+                    js_click_more = """
+                    (() => {
+                        // 댓글 더 보기 버튼들
+                        const selectors = [
+                            'button[class*="more"]',
+                            '[class*="LoadMore"]',
+                            '[class*="load-more"]',
+                            'button:contains("更多")',
+                            'button:contains("展開")',
+                            '[data-testid*="comment"]',
+                            'a[class*="comment"]'
+                        ];
+                        let clicked = 0;
+                        for (const sel of selectors) {
+                            try {
+                                const btns = document.querySelectorAll(sel);
+                                btns.forEach(btn => {
+                                    if (btn.innerText && (btn.innerText.includes('更多') || btn.innerText.includes('留言') || btn.innerText.includes('展開'))) {
+                                        btn.click();
+                                        clicked++;
+                                    }
+                                });
+                            } catch(e) {}
+                        }
+                        return clicked;
+                    })()
+                    """
+                    await page.evaluate(js_click_more)
+                    await asyncio.sleep(2)
+                except:
+                    pass
+
+                # 3. 댓글 영역으로 스크롤
+                try:
+                    js_scroll_comments = """
+                    (() => {
+                        const commentSection = document.querySelector('[class*="Comment"], [class*="comment"], [id*="comment"]');
+                        if (commentSection) {
+                            commentSection.scrollIntoView({behavior: 'smooth'});
+                            return true;
+                        }
+                        return false;
+                    })()
+                    """
+                    await page.evaluate(js_scroll_comments)
+                    await asyncio.sleep(2)
+                except:
+                    pass
+
+                # 4. 추가 스크롤로 더 많은 댓글 로드
+                for i in range(5):
+                    await page.scroll_down(200)
+                    await asyncio.sleep(0.5)
+
+                # 추가 대기 후 컨텐츠 로드
+                await asyncio.sleep(3)
+
+                # 페이지 소스 가져오기
+                content = await page.get_content()
+
+                # 데이터 추출
+                import re
+                like_match = re.search(r'"likeCount"\s*:\s*(\d+)', content)
+                comment_match = re.search(r'"commentCount"\s*:\s*(\d+)', content)
+                title_match = re.search(r'"title"\s*:\s*"([^"]+)"', content)
+                # content 필드 우선 검색 (더 긴 내용), 없으면 excerpt
+                body_match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)(?=",)', content)
+                if not body_match:
+                    body_match = re.search(r'"excerpt"\s*:\s*"((?:[^"\\]|\\.)*)"', content)
+                nickname_match = re.search(r'"nickname"\s*:\s*"([^"]+)"', content)
+                author_match = re.search(r'"school"\s*:\s*"([^"]+)"', content)
+                forum_match = re.search(r'"forumAlias"\s*:\s*"([^"]*)"', content)
+                created_match = re.search(r'"createdAt"\s*:\s*"([^"]+)"', content)
+
+                likes = int(like_match.group(1)) if like_match else 0
+                comments = int(comment_match.group(1)) if comment_match else 0
+
+                if likes > 0 or comments > 0:
+                    # 유니코드 이스케이프 디코딩 적용
+                    raw_title = title_match.group(1) if title_match else None
+                    raw_body = body_match.group(1) if body_match else None
+
+                    # 썸네일 추출 시도 (og:image 또는 Dcard CDN 이미지)
+                    thumbnail = None
+                    thumb_patterns = [
+                        r'<meta\s+property="og:image"\s+content="([^"]+)"',
+                        r'<meta\s+content="([^"]+)"\s+property="og:image"',
+                        r'"url"\s*:\s*"(https://[^"]*dcard[^"]*\.jpg)"',
+                        r'"url"\s*:\s*"(https://[^"]*dcard[^"]*\.png)"',
+                    ]
+                    for pattern in thumb_patterns:
+                        thumb_match = re.search(pattern, content)
+                        if thumb_match:
+                            thumbnail = thumb_match.group(1)
+                            break
+
+                    # 댓글 내용 추출 시도 (nodriver) - 다중 방법 시도
+                    comments_list = []
+                    post_id = self._extract_post_id(url)
+
+                    # 방법 0: __NEXT_DATA__에서 초기 댓글 추출 (가장 빠름)
+                    try:
+                        print("[Dcard] __NEXT_DATA__에서 댓글 검색 중...")
+                        next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>([^<]+)</script>', content)
+                        if next_data_match:
+                            import json as json_module
+                            next_data = json_module.loads(next_data_match.group(1))
+
+                            # pageProps에서 comments 찾기
+                            def extract_comments_from_data(obj, found_comments, depth=0):
+                                if depth > 15 or len(found_comments) >= 10:
+                                    return
+                                if isinstance(obj, dict):
+                                    # comments 키가 있으면 추출
+                                    if 'comments' in obj and isinstance(obj['comments'], list):
+                                        for c in obj['comments'][:10]:
+                                            if isinstance(c, dict) and c.get('content'):
+                                                found_comments.append({
+                                                    'author': c.get('school') or 'Anonymous',
+                                                    'text': decode_unicode_escapes(c['content'])[:200],
+                                                    'likes': c.get('likeCount', 0) or 0,
+                                                })
+                                    for v in obj.values():
+                                        extract_comments_from_data(v, found_comments, depth + 1)
+                                elif isinstance(obj, list):
+                                    for item in obj[:30]:
+                                        extract_comments_from_data(item, found_comments, depth + 1)
+
+                            temp_comments = []
+                            extract_comments_from_data(next_data, temp_comments)
+                            if temp_comments:
+                                comments_list = temp_comments[:10]
+                                print(f"[Dcard] __NEXT_DATA__에서 댓글 {len(comments_list)}개 발견!")
+                                logger.info(f"__NEXT_DATA__에서 댓글 {len(comments_list)}개 수집")
+                    except Exception as nd_err:
+                        logger.debug(f"__NEXT_DATA__ 댓글 추출 실패: {nd_err}")
+
+                    # 방법 1: 브라우저 내 fetch로 댓글 API 호출 (인증된 세션 사용)
+                    if not comments_list and post_id:
+                        try:
+                            print("[Dcard] 브라우저 fetch로 댓글 API 호출 시도...")
+                            # 구버전 _api와 신버전 service/api/v2 둘 다 시도
+                            js_fetch_comments = f"""
+                            (async () => {{
+                                const endpoints = [
+                                    'https://www.dcard.tw/service/api/v2/posts/{post_id}/comments?limit=30',
+                                    'https://www.dcard.tw/_api/posts/{post_id}/comments?limit=30'
+                                ];
+
+                                for (const url of endpoints) {{
+                                    try {{
+                                        const response = await fetch(url, {{
+                                            method: 'GET',
+                                            credentials: 'include',
+                                            headers: {{
+                                                'Accept': 'application/json',
+                                                'Referer': window.location.href
+                                            }}
+                                        }});
+
+                                        if (response.ok) {{
+                                            const data = await response.json();
+                                            if (Array.isArray(data) && data.length > 0) {{
+                                                return JSON.stringify({{success: true, data: data, endpoint: url}});
+                                            }}
+                                        }}
+                                    }} catch (e) {{
+                                        // 계속 다음 endpoint 시도
+                                    }}
+                                }}
+                                return JSON.stringify({{success: false, error: 'All endpoints failed'}});
+                            }})()
+                            """
+
+                            api_result = await page.evaluate(js_fetch_comments)
+                            print(f"[Dcard] fetch 결과: {str(api_result)[:150]}...")
+
+                            if api_result and api_result != 'null':
+                                import json as json_module
+                                result_data = json_module.loads(api_result)
+                                if result_data.get('success') and result_data.get('data'):
+                                    for comment in result_data['data'][:10]:
+                                        if isinstance(comment, dict):
+                                            raw_content = comment.get('content', '')
+                                            if raw_content:
+                                                comments_list.append({
+                                                    'author': comment.get('school') or 'Anonymous',
+                                                    'text': decode_unicode_escapes(raw_content)[:200],
+                                                    'likes': comment.get('likeCount', 0) or 0,
+                                                })
+                                    if comments_list:
+                                        logger.info(f"브라우저 fetch로 댓글 {len(comments_list)}개 수집 (endpoint: {result_data.get('endpoint')})")
+                                        print(f"[Dcard] 브라우저 fetch로 댓글 {len(comments_list)}개 수집 성공!")
+                        except Exception as fetch_err:
+                            logger.debug(f"브라우저 fetch 실패: {fetch_err}")
+                            print(f"[Dcard] 브라우저 fetch 실패: {fetch_err}")
+
+                    # 방법 2: DOM에서 직접 추출 (API 실패 시)
+                    if not comments_list:
+                        print("[Dcard] DOM에서 댓글 추출 시도...")
+                        # 댓글 영역 로드를 위해 추가 스크롤
+                        for _ in range(5):
+                            await page.scroll_down(400)
+                            await asyncio.sleep(1)
+
+                        # 약간의 대기 후 content 다시 가져오기
+                        await asyncio.sleep(2)
+                        content = await page.get_content()
+
+                        js_get_comments = """
+                        (() => {
+                            const comments = [];
+                            const seen = new Set();
+
+                            // Dcard 댓글 컨테이너 - 실제 구조 기반
+                            const selectors = [
+                                'article[class*="Comment"] div[class*="Content"]',
+                                '[class*="CommentContent"]',
+                                '[class*="comment_content"]',
+                                'div[class^="sc-"] > p'
+                            ];
+
+                            for (const sel of selectors) {
+                                try {
+                                    const elements = document.querySelectorAll(sel);
+                                    elements.forEach(el => {
+                                        if (comments.length >= 10) return;
+                                        const text = (el.innerText || '').trim();
+                                        if (text && text.length >= 10 && text.length < 500 && !seen.has(text)) {
+                                            if (!text.includes('留言') && !text.includes('讚') && !text.includes('回覆')) {
+                                                seen.add(text);
+                                                comments.push({author: 'Anonymous', text: text.substring(0, 200)});
+                                            }
+                                        }
+                                    });
+                                } catch(e) {}
+                                if (comments.length >= 10) break;
+                            }
+                            return JSON.stringify(comments);
+                        })()
+                        """
+                        comments_json = await page.evaluate(js_get_comments)
+                        if comments_json:
+                            import json as json_module
+                            parsed_comments = json_module.loads(comments_json)
+                            for c in parsed_comments:
+                                if c.get('text'):
+                                    comments_list.append({
+                                        'author': c.get('author', 'Anonymous'),
+                                        'text': decode_unicode_escapes(c['text'])
+                                    })
+                            if comments_list:
+                                logger.info(f"nodriver DOM에서 댓글 {len(comments_list)}개 수집")
+
+                    # 방법 3: 페이지 소스 JSON에서 댓글 추출 (fallback)
+                    if not comments_list:
+                        # Dcard API 응답 내 댓글 패턴
+                        # "comments":[{"id":...,"content":"댓글내용",...}]
+                        import json as json_module
+
+                        # 직접 패턴 매칭 (fallback)
+                        comments_pattern = r'"comments"\s*:\s*\[(.*?)\]'
+                        comments_match = re.search(comments_pattern, content, re.DOTALL)
+                        if comments_match:
+                            comment_contents = re.findall(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', comments_match.group(1))
+                            for i, c_text in enumerate(comment_contents[:10]):
+                                if c_text and len(c_text) > 5:
+                                    comments_list.append({
+                                        'author': 'Anonymous',
+                                        'text': decode_unicode_escapes(c_text)[:200]
+                                    })
+                        if comments_list:
+                            logger.info(f"JSON 패턴에서 댓글 {len(comments_list)}개 수집")
+
+                    if comments_list:
+                        logger.info(f"nodriver 댓글 {len(comments_list)}개 수집됨")
+                        print(f"[Dcard] 총 {len(comments_list)}개 댓글 수집 완료")
+
+                    result = {
+                        "platform": "dcard",
+                        "url": url,
+                        "post_id": self._extract_post_id(url),
+                        "author": (nickname_match.group(1) if nickname_match else None) or (author_match.group(1) if author_match else None) or "Anonymous",
+                        "title": decode_unicode_escapes(raw_title) if raw_title else None,
+                        "content": decode_unicode_escapes(raw_body) if raw_body else None,  # 게시물 본문 (유니코드 디코딩)
+                        "likes": likes,
+                        "comments": comments,
+                        "shares": None,
+                        "views": None,
+                        "forum": forum_match.group(1) if forum_match else None,
+                        "created_at": created_match.group(1) if created_match else None,
+                        "thumbnail": thumbnail,
+                        "comments_list": comments_list,
+                        "crawled_at": datetime.now().isoformat(),
+                    }
+                    logger.info(f"nodriver 크롤링 성공: likes={likes}, comments={comments}")
+                    print(f"[Dcard] nodriver 성공: likes={likes}, comments={comments}")
+                    return result
+                else:
+                    logger.warning("nodriver: 데이터 추출 실패")
+                    # 앱 다운로드 페이지인지 확인
+                    if '下載' in content or 'download' in content.lower():
+                        logger.warning("nodriver: 앱 다운로드 페이지 감지")
+                    return None
+
+            except Exception as e:
+                logger.error(f"nodriver 크롤링 오류: {e}")
+                return None
+            finally:
+                if browser:
+                    try:
+                        await browser.stop()
+                    except:
+                        pass
+
+        # 비동기 함수 실행 (재시도 포함)
+        for attempt in range(max_retries):
+            try:
+                # 새 이벤트 루프 생성하여 실행 (연속 호출 충돌 방지)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result = loop.run_until_complete(_async_crawl())
+                    if result:
+                        return result
+                    elif attempt < max_retries - 1:
+                        logger.info(f"nodriver 재시도 {attempt + 2}/{max_retries}...")
+                        print(f"[Dcard] nodriver 재시도 {attempt + 2}/{max_retries}...")
+                        time.sleep(2)
+                finally:
+                    loop.close()
+            except Exception as e:
+                logger.error(f"nodriver asyncio 오류 (시도 {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
 
         return None
 
@@ -300,11 +953,28 @@ class DcardCrawler:
             options.add_argument("--disable-default-apps")
             options.add_argument("--disable-sync")
 
+            # Chrome 브라우저 버전 자동 감지
+            chrome_version = None
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['reg', 'query', r'HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon', '/v', 'version'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        if 'version' in line.lower():
+                            ver = line.strip().split()[-1]
+                            chrome_version = int(ver.split('.')[0])
+                            logger.info(f"Chrome 버전 감지: {chrome_version}")
+            except Exception:
+                pass
+
             # undetected-chromedriver 특수 옵션
             driver = uc.Chrome(
                 options=options,
                 use_subprocess=True,  # 서브프로세스 사용 (탐지 회피)
-                version_main=None,  # 자동 버전 매칭
+                version_main=chrome_version,  # 실제 Chrome 버전 매칭
             )
 
             # 추가 스텔스 JavaScript 실행
@@ -462,31 +1132,50 @@ class DcardCrawler:
         Returns:
             인증 성공 여부
         """
-        logger.info("=" * 50)
-        logger.info("Cloudflare 인증이 필요할 수 있습니다.")
-        logger.info("브라우저 창에서 인증을 완료해주세요.")
-        logger.info(f"대기 시간: {self.CLOUDFLARE_WAIT}초")
-        logger.info("=" * 50)
+        print("")
+        print("=" * 60)
+        print("[Dcard] Cloudflare 보안 인증이 필요합니다!")
+        print("")
+        print("  브라우저 창에서 '사람입니다' 체크박스를 클릭하거나")
+        print("  보안 인증을 완료해주세요.")
+        print("")
+        print(f"  대기 시간: {self.CLOUDFLARE_WAIT}초")
+        print("=" * 60)
+        print("")
+
+        logger.info("Cloudflare 인증 대기 시작")
 
         start_time = time.time()
+        last_print_time = start_time
 
         while time.time() - start_time < self.CLOUDFLARE_WAIT:
-            page_source = self.driver.page_source
+            try:
+                page_source = self.driver.page_source
+                page_title = self.driver.title.lower()
 
-            # Cloudflare 체크 완료 확인
-            if "Just a moment" not in page_source and "Cloudflare" not in self.driver.title:
-                # 실제 Dcard 페이지인지 확인
-                if "dcard" in self.driver.title.lower() or "__NEXT_DATA__" in page_source:
-                    logger.info("Cloudflare 인증 성공!")
-                    self._save_cookies()
-                    return True
+                # Cloudflare 체크 완료 확인
+                if "just a moment" not in page_source.lower() and "cloudflare" not in page_title:
+                    # 실제 Dcard 페이지인지 확인
+                    if "dcard" in page_title or "__NEXT_DATA__" in page_source or '"likeCount"' in page_source:
+                        print("[Dcard] Cloudflare 인증 성공!")
+                        logger.info("Cloudflare 인증 성공!")
+                        self._save_cookies()
+                        return True
 
-            remaining = int(self.CLOUDFLARE_WAIT - (time.time() - start_time))
-            if remaining % 5 == 0:
-                logger.info(f"Cloudflare 인증 대기 중... 남은 시간: {remaining}초")
+                # 진행 상황 출력 (5초마다)
+                current_time = time.time()
+                if current_time - last_print_time >= 5:
+                    remaining = int(self.CLOUDFLARE_WAIT - (current_time - start_time))
+                    print(f"[Dcard] Cloudflare 인증 대기 중... (남은 시간: {remaining}초)")
+                    last_print_time = current_time
 
-            time.sleep(1)
+                time.sleep(1)
 
+            except Exception as e:
+                logger.debug(f"인증 확인 중 오류 (무시): {e}")
+                time.sleep(1)
+
+        print("[Dcard] Cloudflare 인증 시간 초과 (실패)")
         logger.warning("Cloudflare 인증 시간 초과")
         return False
 
@@ -522,7 +1211,8 @@ class DcardCrawler:
         if match:
             return match.group(1)
 
-        raise ValueError(f"게시물 ID를 추출할 수 없습니다: {url}")
+        logger.warning(f"게시물 ID를 추출할 수 없습니다: {url}")
+        return None
 
     def _parse_count(self, text: str) -> int:
         """
@@ -582,6 +1272,7 @@ class DcardCrawler:
             "post_id": None,
             "author": None,
             "title": None,
+            "content": None,  # 게시물 본문 내용
             "likes": 0,
             "comments": 0,
             "shares": None,
@@ -630,17 +1321,21 @@ class DcardCrawler:
                 post = props.get("post") or props.get("initialPost", {})
 
                 if post and post.get("likeCount") is not None:
-                    result["title"] = post.get("title", "")
+                    # content 우선, 없으면 excerpt (유니코드 디코딩 적용)
+                    raw_title = post.get("title", "")
+                    raw_content = post.get("content", "") or post.get("excerpt", "")
+                    result["title"] = decode_unicode_escapes(raw_title)
+                    result["content"] = decode_unicode_escapes(raw_content)
                     result["likes"] = post.get("likeCount", 0) or 0
                     result["comments"] = post.get("commentCount", 0) or 0
                     result["forum"] = post.get("forumAlias", "")
                     result["created_at"] = post.get("createdAt", "")
 
-                    # 작성자 정보
+                    # 작성자 정보 (school/nickname이 null일 수 있으므로 or 사용)
                     if "member" in post and post["member"]:
-                        result["author"] = post["member"].get("nickname", "Anonymous")
-                    elif "school" in post:
-                        result["author"] = post.get("school", "Anonymous")
+                        result["author"] = post["member"].get("nickname") or post.get("school") or "Anonymous"
+                    elif post.get("school"):
+                        result["author"] = post["school"]
                     else:
                         result["author"] = "Anonymous"
 
@@ -658,19 +1353,34 @@ class DcardCrawler:
             like_match = re.search(r'"likeCount"\s*:\s*(\d+)', page_source)
             comment_match = re.search(r'"commentCount"\s*:\s*(\d+)', page_source)
             title_match = re.search(r'"title"\s*:\s*"([^"]+)"', page_source)
+            # content 필드 우선 검색, 없으면 excerpt
+            body_match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)(?=",)', page_source)
+            if not body_match:
+                body_match = re.search(r'"excerpt"\s*:\s*"((?:[^"\\]|\\.)*)"', page_source)
             share_match = re.search(r'"shareCount"\s*:\s*(\d+)', page_source)
             created_match = re.search(r'"createdAt"\s*:\s*"([^"]+)"', page_source)
+            # 작성자 추출 (nickname > school > Anonymous)
+            nickname_match = re.search(r'"nickname"\s*:\s*"([^"]+)"', page_source)
+            school_match = re.search(r'"school"\s*:\s*"([^"]+)"', page_source)
 
             if like_match:
                 result["likes"] = int(like_match.group(1))
             if comment_match:
                 result["comments"] = int(comment_match.group(1))
             if title_match:
-                result["title"] = title_match.group(1)
+                result["title"] = decode_unicode_escapes(title_match.group(1))
+            if body_match:
+                result["content"] = decode_unicode_escapes(body_match.group(1))
             if share_match:
                 result["shares"] = int(share_match.group(1))
             if created_match:
                 result["created_at"] = created_match.group(1)
+            # 작성자 설정
+            if not result["author"]:
+                if nickname_match:
+                    result["author"] = nickname_match.group(1)
+                elif school_match:
+                    result["author"] = school_match.group(1)
 
             # 데이터가 추출되었으면 반환
             if result["likes"] > 0 or result["comments"] > 0:
@@ -686,9 +1396,11 @@ class DcardCrawler:
             # === DOM에서 직접 추출 (CSR 대응) ===
             logger.info("DOM에서 직접 데이터 추출 시도 (스크롤 후)")
 
-            # 스크롤하여 engagement 영역 로드
-            self.driver.execute_script("window.scrollTo(0, 500);")
-            time.sleep(3)
+            # 스크롤하여 engagement 영역 로드 (더 많이 스크롤)
+            self.driver.execute_script("window.scrollTo(0, 300);")
+            time.sleep(2)
+            self.driver.execute_script("window.scrollTo(0, 600);")
+            time.sleep(2)
 
             # 제목 추출
             try:
@@ -702,44 +1414,149 @@ class DcardCrawler:
             if forum_match:
                 result["forum"] = forum_match.group(1)
 
-            # JavaScript로 reaction 영역에서 숫자 추출
-            engagement_data = self.driver.execute_script('''
-                var results = {likes: 0, comments: 0};
+            # 페이지 소스 다시 확인 (스크롤 후 동적 로드된 데이터)
+            page_source = self.driver.page_source
+            like_match = re.search(r'"likeCount"\s*:\s*(\d+)', page_source)
+            comment_match = re.search(r'"commentCount"\s*:\s*(\d+)', page_source)
 
-                // 방법 1: SVG 아이콘 근처의 숫자 찾기
-                var svgs = document.querySelectorAll('svg');
-                svgs.forEach(function(svg) {
-                    var parent = svg.parentElement;
-                    if (parent) {
-                        var container = parent.parentElement;
-                        if (container) {
-                            var rect = parent.getBoundingClientRect();
-                            // 게시물 본문 하단 영역 (y > 500)
-                            if (rect.y > 500 && rect.y < 900) {
-                                var text = container.innerText || '';
-                                var nums = text.match(/\\d+/g);
-                                if (nums && nums.length >= 1) {
-                                    // 첫 번째 숫자는 좋아요, 두 번째는 댓글
-                                    if (results.likes === 0) {
-                                        results.likes = parseInt(nums[0]) || 0;
-                                        if (nums.length >= 2) {
-                                            results.comments = parseInt(nums[1]) || 0;
-                                        }
-                                    }
-                                }
-                            }
+            if like_match:
+                result["likes"] = int(like_match.group(1))
+            if comment_match:
+                result["comments"] = int(comment_match.group(1))
+
+            # 데이터가 있으면 반환
+            if result["likes"] > 0 or result["comments"] > 0:
+                logger.info(f"스크롤 후 JSON 패턴에서 데이터 추출 성공: likes={result['likes']}, comments={result['comments']}")
+                if not result["author"]:
+                    result["author"] = "Anonymous"
+                return result
+
+            # JavaScript로 reaction 영역에서 숫자 추출 (다양한 방법 시도)
+            engagement_data = self.driver.execute_script('''
+                var results = {likes: 0, comments: 0, debug: []};
+
+                // 방법 1: button 요소 안의 숫자 찾기 (Dcard reaction 버튼)
+                var buttons = document.querySelectorAll('button');
+                var likeFound = false;
+                var commentFound = false;
+
+                buttons.forEach(function(btn, idx) {
+                    var text = btn.innerText || btn.textContent || '';
+                    var nums = text.match(/\\d+/);
+                    if (nums) {
+                        var num = parseInt(nums[0]);
+                        // 좋아요 버튼 (하트 아이콘 또는 첫 번째 숫자)
+                        if (!likeFound && (btn.innerHTML.includes('heart') || btn.innerHTML.includes('like') || btn.innerHTML.includes('svg'))) {
+                            results.likes = num;
+                            likeFound = true;
+                            results.debug.push('button heart: ' + num);
+                        }
+                        // 댓글 버튼
+                        else if (!commentFound && (btn.innerHTML.includes('comment') || btn.innerHTML.includes('message') || btn.innerHTML.includes('chat'))) {
+                            results.comments = num;
+                            commentFound = true;
+                            results.debug.push('button comment: ' + num);
                         }
                     }
                 });
 
-                // 방법 2: 특정 패턴으로 숫자 찾기 (백업)
+                // 방법 2: aria-label 속성으로 찾기
                 if (results.likes === 0) {
-                    var allText = document.body.innerText || '';
-                    // "252 32" 같은 패턴 찾기 (reaction 영역)
-                    var matches = allText.match(/(\\d+)\\s+(\\d+)\\s*$/m);
-                    if (matches) {
-                        results.likes = parseInt(matches[1]) || 0;
-                        results.comments = parseInt(matches[2]) || 0;
+                    var likeBtn = document.querySelector('[aria-label*="like"], [aria-label*="heart"], [aria-label*="愛心"], [aria-label*="喜歡"]');
+                    if (likeBtn) {
+                        var text = likeBtn.innerText || likeBtn.textContent || '';
+                        var nums = text.match(/\\d+/);
+                        if (nums) {
+                            results.likes = parseInt(nums[0]);
+                            results.debug.push('aria-label like: ' + nums[0]);
+                        }
+                    }
+                }
+
+                if (results.comments === 0) {
+                    var commentBtn = document.querySelector('[aria-label*="comment"], [aria-label*="留言"], [aria-label*="回應"]');
+                    if (commentBtn) {
+                        var text = commentBtn.innerText || commentBtn.textContent || '';
+                        var nums = text.match(/\\d+/);
+                        if (nums) {
+                            results.comments = parseInt(nums[0]);
+                            results.debug.push('aria-label comment: ' + nums[0]);
+                        }
+                    }
+                }
+
+                // 방법 3: SVG 근처의 숫자 (더 넓은 범위 검색)
+                if (results.likes === 0) {
+                    var svgs = document.querySelectorAll('svg');
+                    var foundNumbers = [];
+
+                    svgs.forEach(function(svg, idx) {
+                        // SVG의 부모 요소들에서 숫자 찾기
+                        var parent = svg.parentElement;
+                        for (var i = 0; i < 5 && parent; i++) {
+                            var text = parent.innerText || '';
+                            var nums = text.match(/^\\s*(\\d+)\\s*$/);
+                            if (nums) {
+                                foundNumbers.push(parseInt(nums[1]));
+                            }
+                            parent = parent.parentElement;
+                        }
+
+                        // 형제 요소에서도 찾기
+                        var sibling = svg.nextElementSibling;
+                        if (sibling) {
+                            var text = sibling.innerText || sibling.textContent || '';
+                            var nums = text.match(/\\d+/);
+                            if (nums) {
+                                foundNumbers.push(parseInt(nums[0]));
+                            }
+                        }
+                    });
+
+                    if (foundNumbers.length >= 2) {
+                        results.likes = foundNumbers[0];
+                        results.comments = foundNumbers[1];
+                        results.debug.push('svg numbers: ' + foundNumbers.join(', '));
+                    } else if (foundNumbers.length === 1) {
+                        results.likes = foundNumbers[0];
+                        results.debug.push('svg single: ' + foundNumbers[0]);
+                    }
+                }
+
+                // 방법 4: 특정 클래스 패턴으로 찾기
+                if (results.likes === 0) {
+                    // Dcard의 reaction 영역 클래스 패턴
+                    var reactionContainers = document.querySelectorAll('[class*="reaction"], [class*="Reaction"], [class*="engagement"], [class*="Engagement"], [class*="action"], [class*="Action"]');
+                    reactionContainers.forEach(function(container) {
+                        var text = container.innerText || '';
+                        var nums = text.match(/\\d+/g);
+                        if (nums && nums.length >= 1) {
+                            if (results.likes === 0) results.likes = parseInt(nums[0]);
+                            if (nums.length >= 2 && results.comments === 0) results.comments = parseInt(nums[1]);
+                            results.debug.push('class pattern: ' + nums.join(', '));
+                        }
+                    });
+                }
+
+                // 방법 5: article 하단의 숫자들 (마지막 시도)
+                if (results.likes === 0) {
+                    var article = document.querySelector('article');
+                    if (article) {
+                        var allSpans = article.querySelectorAll('span');
+                        var nums = [];
+                        allSpans.forEach(function(span) {
+                            var text = span.innerText || '';
+                            if (/^\\d+$/.test(text.trim())) {
+                                nums.push(parseInt(text.trim()));
+                            }
+                        });
+                        if (nums.length >= 2) {
+                            // 일반적으로 좋아요가 더 크고, 댓글이 더 작음
+                            nums.sort(function(a, b) { return b - a; });
+                            results.likes = nums[0];
+                            results.comments = nums[1];
+                            results.debug.push('article spans: ' + nums.join(', '));
+                        }
                     }
                 }
 
@@ -747,6 +1564,10 @@ class DcardCrawler:
             ''')
 
             if engagement_data:
+                # 디버그 정보 로깅
+                if engagement_data.get("debug"):
+                    logger.info(f"JS 추출 디버그: {engagement_data.get('debug')}")
+
                 if engagement_data.get("likes", 0) > 0:
                     result["likes"] = engagement_data["likes"]
                 if engagement_data.get("comments", 0) > 0:
@@ -793,9 +1614,24 @@ class DcardCrawler:
                 "crawled_at": str
             }
         """
-        # URL 유효성 검사
+        # URL 유효성 검사 - ValueError 대신 에러 dict 반환 (verify-bot 프로토콜)
         if not url:
-            raise ValueError("URL이 비어있습니다")
+            logger.error("URL이 비어있습니다")
+            return {
+                "platform": "dcard",
+                "url": "",
+                "post_id": None,
+                "author": None,
+                "title": None,
+                "content": None,
+                "likes": 0,
+                "comments": 0,
+                "shares": 0,
+                "views": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": "URL이 비어있습니다.",
+                "error_type": "validation_error"
+            }
 
         # 게시물 ID 추출
         post_id = None
@@ -803,9 +1639,41 @@ class DcardCrawler:
             post_id = url
             url = f"{self.BASE_URL}/f/all/p/{url}"
         elif "dcard.tw" not in url:
-            raise ValueError(f"유효하지 않은 Dcard URL: {url}")
+            logger.error(f"유효하지 않은 Dcard URL: {url}")
+            return {
+                "platform": "dcard",
+                "url": url,
+                "post_id": None,
+                "author": None,
+                "title": None,
+                "content": None,
+                "likes": 0,
+                "comments": 0,
+                "shares": 0,
+                "views": None,
+                "crawled_at": datetime.now().isoformat(),
+                "error": "유효하지 않은 Dcard URL입니다. dcard.tw 도메인이 포함된 URL을 입력해주세요.",
+                "error_type": "validation_error"
+            }
         else:
             post_id = self._extract_post_id(url)
+            # post_id 추출 실패 시 에러 반환
+            if not post_id:
+                return {
+                    "platform": "dcard",
+                    "url": url,
+                    "post_id": None,
+                    "author": None,
+                    "title": None,
+                    "content": None,
+                    "likes": 0,
+                    "comments": 0,
+                    "shares": 0,
+                    "views": None,
+                    "crawled_at": datetime.now().isoformat(),
+                    "error": "URL에서 게시물 ID를 추출할 수 없습니다. 올바른 Dcard 게시물 URL인지 확인해주세요.",
+                    "error_type": "validation_error"
+                }
 
         # 1. API 방식 우선 시도 (cloudscraper25 v2/v3 지원)
         if self.use_api and self.scraper and post_id:
@@ -814,10 +1682,18 @@ class DcardCrawler:
             result = self._crawl_via_api(post_id, max_retries=3)
             if result:
                 return result
-            print("[Dcard] API 방식 실패, 브라우저 모드로 전환 중...")
-            logger.info("API 방식 실패, Selenium fallback...")
+            print("[Dcard] API 방식 실패, nodriver로 전환 중...")
+            logger.info("API 방식 실패, nodriver fallback 시도...")
 
-        # 2. Cloud 환경에서는 API만 지원 (Selenium은 Cloudflare 우회 불가)
+        # 2. nodriver 방식 시도 (Cloudflare 자동 우회, 2025 권장)
+        if HAS_NODRIVER and not IS_CLOUD:
+            result = self._crawl_via_nodriver(url)
+            if result:
+                return result
+            print("[Dcard] nodriver 실패, Selenium으로 전환 중...")
+            logger.info("nodriver 실패, Selenium fallback...")
+
+        # 3. Cloud 환경에서는 API만 지원 (Selenium은 Cloudflare 우회 불가)
         if IS_CLOUD:
             # API를 시도했으나 실패한 경우
             if self.use_api and self.scraper:
@@ -841,7 +1717,7 @@ class DcardCrawler:
                 "cloudscraper 라이브러리가 설치되어 있는지 확인하세요."
             )
 
-        # 3. Selenium fallback (로컬 환경)
+        # 4. Selenium fallback (로컬 환경)
         if self.driver is None:
             print("[Dcard] Chrome 브라우저 시작 중...")
             logger.info("Chrome WebDriver 생성 중...")
@@ -873,7 +1749,7 @@ class DcardCrawler:
                 if is_blocked:
                     print("")
                     print("=" * 60)
-                    print("[Dcard] ⚠️ Cloudflare 보안에 의해 차단되었습니다.")
+                    print("[Dcard] [경고] Cloudflare 보안에 의해 차단되었습니다.")
                     print("")
                     print("해결 방법:")
                     print("  1. VPN을 사용하세요 (대만 서버 권장)")
@@ -890,6 +1766,10 @@ class DcardCrawler:
                         "VPN(대만 서버) 사용 또는 다른 네트워크로 시도해주세요. "
                         "Dcard는 대만 플랫폼으로 해외 접속이 제한될 수 있습니다."
                     )
+
+            # 작성자 안전장치: None이면 "Anonymous"로 보정
+            if not result.get("author"):
+                result["author"] = "Anonymous"
 
             return result
 
@@ -909,7 +1789,7 @@ class DcardCrawler:
                 "platform": "dcard",
                 "url": url,
                 "post_id": post_id,
-                "author": None,
+                "author": "Anonymous",
                 "title": None,
                 "likes": 0,
                 "comments": 0,
@@ -922,7 +1802,7 @@ class DcardCrawler:
     def crawl_posts(
         self,
         urls: List[str],
-        delay: float = 2.0,
+        delay: float = 8.0,  # Cloudflare 차단 방지를 위해 8초로 증가
         continue_on_error: bool = True
     ) -> List[Dict[str, Any]]:
         """
@@ -974,6 +1854,10 @@ class DcardCrawler:
                 logger.warning(f"브라우저 종료 중 오류: {e}")
             finally:
                 self.driver = None
+
+    def cleanup(self) -> None:
+        """리소스 정리 (close의 별칭)"""
+        self.close()
 
     def __enter__(self):
         """Context manager 진입"""
