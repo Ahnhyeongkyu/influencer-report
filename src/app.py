@@ -573,10 +573,19 @@ def get_crawl_failure_reason(result: dict) -> str:
         실패 이유 메시지
     """
     error = result.get("error", "")
+    error_type = result.get("error_type", "")
     platform = result.get("platform", "")
 
-    # 명시적 에러가 있는 경우
+    # error_type 기반 분류 (크롤러에서 설정)
+    if error_type == "not_found":
+        return "게시물이 삭제되었거나 비공개 상태입니다"
+    if error_type == "validation_error":
+        return "잘못된 URL 형식입니다"
+
+    # 명시적 에러가 있는 경우 (문자열 매칭 fallback)
     if error:
+        if "삭제" in error or "비공개" in error or "not found" in error.lower():
+            return "게시물이 삭제되었거나 비공개 상태입니다"
         if "timeout" in error.lower() or "시간" in error:
             return "페이지 로드 시간 초과"
         if "cookie" in error.lower() or "쿠키" in error or "로그인" in error:
@@ -680,6 +689,15 @@ def run_crawling():
         st.error("크롤링할 유효한 URL이 없습니다.")
         st.session_state.crawling_status = "error"
         return
+
+    # 동일 URL 중복 검출 경고
+    url_list = [u.get("url", "") for u in valid_urls]
+    duplicates = [u for u in set(url_list) if url_list.count(u) > 1]
+    if duplicates:
+        st.warning(f"동일한 URL이 {len(duplicates)}건 중복 입력되었습니다. 중복 URL은 각각 별도로 크롤링됩니다.")
+        logger.warning(f"중복 URL 감지: {duplicates}")
+
+    logger.info(f"크롤링 시작: 총 {len(valid_urls)}개 URL ({len(set(url_list))}개 고유)")
 
     st.markdown("### 크롤링 진행 중")
 
@@ -1324,7 +1342,8 @@ def render_results():
         "platform": "플랫폼",
         "url": "URL",
         "author": "작성자",
-        "title": "제목/내용",
+        "title": "제목",
+        "content": "내용",
         "likes": "좋아요",
         "comments": "댓글",
         "shares": "공유",
@@ -1335,7 +1354,17 @@ def render_results():
     }
     df_display = df.rename(columns=column_rename)
 
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "URL": st.column_config.TextColumn("URL", width="small"),
+            "제목": st.column_config.TextColumn("제목", width="medium"),
+            "내용": st.column_config.TextColumn("내용", width="medium"),
+            "수집시간": st.column_config.TextColumn("수집시간", width="small"),
+        },
+    )
 
     # 다운로드 버튼
     st.markdown("---")
@@ -1343,7 +1372,7 @@ def render_results():
 
     with col1:
         # CSV 다운로드
-        csv = df.to_csv(index=False, encoding="utf-8-sig")
+        csv = df.to_csv(index=False).encode('utf-8-sig')
         campaign_name = st.session_state.campaign_info.get("name", "campaign")
         filename = f"{campaign_name}_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 

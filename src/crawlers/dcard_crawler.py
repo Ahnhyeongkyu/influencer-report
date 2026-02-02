@@ -1824,6 +1824,19 @@ class DcardCrawler:
                 result = self.crawl_post(url)
                 results.append(result)
 
+            except DcardPostNotFoundError as e:
+                logger.warning(f"게시물 없음 ({url}): {e}")
+                if continue_on_error:
+                    results.append({
+                        "platform": "dcard",
+                        "url": url,
+                        "error": "게시물이 삭제되었거나 접근할 수 없습니다",
+                        "error_type": "not_found",
+                        "crawled_at": datetime.now().isoformat(),
+                    })
+                else:
+                    raise
+
             except Exception as e:
                 logger.error(f"크롤링 실패 ({url}): {e}")
 

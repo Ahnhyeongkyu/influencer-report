@@ -2061,12 +2061,17 @@ class XHSCrawler:
 
             except Exception as e:
                 logger.error(f"크롤링 실패 ({url}): {e}")
-                results.append({
+                error_msg = str(e)
+                error_type = "not_found" if any(kw in error_msg for kw in ["찾을 수 없", "not found", "404", "삭제"]) else None
+                error_result = {
                     "platform": "xiaohongshu",
                     "url": url,
-                    "error": str(e),
+                    "error": error_msg,
                     "crawled_at": datetime.now().isoformat(),
-                })
+                }
+                if error_type:
+                    error_result["error_type"] = error_type
+                results.append(error_result)
 
         return results
 

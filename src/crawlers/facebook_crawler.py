@@ -282,6 +282,9 @@ class FacebookCrawler:
         }
 
         try:
+            # HTML 엔티티 디코딩 (좋아요/댓글 수 regex 매칭 정확도 향상)
+            html = html_module.unescape(html)
+
             # 좋아요 수 추출
             like_patterns = [
                 r'(\d+(?:,\d+)*)\s*(?:likes?|좋아요)',
@@ -519,15 +522,16 @@ class FacebookCrawler:
             if text:
                 comments_list.append(text[:200])
 
-        # 댓글 수: comments_full 길이 우선, 없으면 comments 필드
-        comment_count = len(raw_comments) if raw_comments else (post.get('comments', 0) or 0)
+        # 댓글 수: comments 필드(HTML 추출 값) 우선, 없으면 comments_full 길이 fallback
+        html_comment_count = post.get('comments', 0) or 0
+        comment_count = html_comment_count if html_comment_count > 0 else len(raw_comments)
 
         return {
             "platform": "facebook",
             "url": url,
             "author": post.get('username') or post.get('user_id') or "Unknown",
             "content": (post.get('text') or "")[:500],
-            "likes": post.get('likes', 0) or post.get('reactions', 0) or 0,
+            "likes": self._parse_count(post.get('likes') or post.get('reactions') or 0),
             "comments": comment_count,
             "shares": post.get('shares', 0) or 0,
             "views": post.get('video_views'),
@@ -976,7 +980,11 @@ class FacebookCrawler:
         if not text:
             return 0
 
-        text = text.strip()
+        # 이미 숫자 타입이면 바로 반환
+        if isinstance(text, (int, float)):
+            return int(text)
+
+        text = str(text).strip()
         text_lower = text.lower()
 
         # 숫자 추출 헬퍼 함수 (점만 있는 경우 제외)
@@ -1106,19 +1114,20 @@ class FacebookCrawler:
 
         return 0
 
-    def _extract_comments_count(self, driver: webdriver.Chrome) -> int:
+    def _extract_comments_count(self, driver: webdriver.Chrome, scoped_source: str = None) -> int:
         """
         댓글 수 추출
 
         Args:
             driver: WebDriver 인스턴스
+            scoped_source: 스코핑된 페이지 소스 (None이면 driver.page_source 사용)
 
         Returns:
             댓글 수
         """
         # 먼저 페이지 소스에서 정규식으로 추출 시도 (텍스트 패턴만 - JSON 패턴은 _try_javascript_extraction에서 스코핑 처리)
         try:
-            page_source = driver.page_source
+            page_source = scoped_source or driver.page_source
             # 텍스트 기반 댓글 수 패턴 (DOM에 렌더링된 텍스트 - 타겟 포스트에 해당할 가능성 높음)
             text_comment_patterns = [
                 r'(\d+)\s*(?:개의\s*)?댓글',  # "23개의 댓글", "23 댓글"
@@ -1960,6 +1969,10 @@ class FacebookCrawler:
         }
 
         try:
+            # 스코핑 관련 인스턴스 변수 초기화
+            self._last_scoped_source = None
+            self._scoping_succeeded = False
+
             # Rate limiting 적용
             self._rate_limit()
 
@@ -1987,7 +2000,31 @@ class FacebookCrawler:
             if "login" in current_url.lower() or "checkpoint" in current_url.lower():
                 logger.warning("로그인이 필요한 게시물입니다.")
                 result["error"] = "login_required"
+                result["error_type"] = "login_required"
                 return result
+
+            # 삭제/비공개 게시물 감지
+            try:
+                early_source = self.driver.page_source
+                not_found_indicators = [
+                    "This content isn't available",
+                    "콘텐츠를 사용할 수 없습니다",
+                    "이 콘텐츠를 이용할 수 없습니다",
+                    "This page isn't available",
+                    "이 페이지를 사용할 수 없습니다",
+                    "The link you followed may be broken",
+                    "Sorry, this content isn't available right now",
+                    "일부 대상에게만 공유했거나",
+                    "게시물이 삭제된",
+                ]
+                for indicator in not_found_indicators:
+                    if indicator in early_source:
+                        logger.warning(f"삭제/비공개 게시물 감지: {indicator}")
+                        result["error"] = "게시물이 삭제되었거나 비공개 상태입니다"
+                        result["error_type"] = "not_found"
+                        return result
+            except Exception:
+                pass
 
             # === 작성자 및 제목 추출 ===
             page_source = self.driver.page_source
@@ -2502,15 +2539,33 @@ class FacebookCrawler:
 
             # 댓글: JSON 스코핑이 다른 게시물 데이터를 포함할 수 있으므로 항상 DOM 교차 검증
             json_comments = result["comments"]
-            dom_comments = self._extract_comments_count(self.driver)
+            # DOM 추출 시 스코핑 소스가 있으면 전달 (전체 페이지에서 "2" 등 UI 값 오캡처 방지)
+            scoped_src = getattr(self, '_last_scoped_source', None) if getattr(self, '_scoping_succeeded', False) else None
+            dom_comments = self._extract_comments_count(self.driver, scoped_source=scoped_src)
             if json_comments == 0:
-                result["comments"] = dom_comments
+                # JSON에서 못 찾았을 때: DOM 값이 매우 작고(1-3) 좋아요는 있는 경우 → UI 노이즈 확정, 0 처리
+                if 1 <= dom_comments <= 3 and result.get("likes", 0) > 10:
+                    logger.warning(
+                        f"댓글 노이즈 확정: JSON=0, DOM={dom_comments}, likes={result.get('likes', 0)} "
+                        f"→ 0으로 처리 (작성자 기반 검증에서 복구 가능)"
+                    )
+                    result["comments"] = 0  # 노이즈 제거, 작성자 검증에서 실제값 복구 시도
+                else:
+                    result["comments"] = dom_comments
             elif dom_comments > 0 and json_comments > dom_comments * 5:
-                logger.warning(
-                    f"댓글 교차검증: JSON({json_comments}) vs DOM({dom_comments}), "
-                    f"비율 {json_comments/dom_comments:.0f}x → DOM 값 사용"
-                )
-                result["comments"] = dom_comments
+                # DOM이 매우 작은 값(1-3)이면 UI 노이즈 가능성 → JSON 우선
+                if 1 <= dom_comments <= 3 and json_comments >= 5:
+                    logger.warning(
+                        f"댓글 교차검증: JSON({json_comments}) vs DOM({dom_comments}), "
+                        f"DOM이 노이즈 의심(1-3) → JSON 값 유지"
+                    )
+                    # result["comments"]는 json_comments 그대로 유지
+                else:
+                    logger.warning(
+                        f"댓글 교차검증: JSON({json_comments}) vs DOM({dom_comments}), "
+                        f"비율 {json_comments/dom_comments:.0f}x → DOM 값 사용"
+                    )
+                    result["comments"] = dom_comments
             elif dom_comments == 0 and json_comments > 0:
                 # DOM이 0인데 JSON에 값이 있는 경우: 좋아요 대비 비율로 오염 검증
                 likes = result.get("likes", 0)
@@ -2523,7 +2578,7 @@ class FacebookCrawler:
 
             # 댓글도 작성자 기반 전체 소스 검증
             try:
-                if author_slug_for_verify and result["comments"] <= 1:
+                if author_slug_for_verify and result["comments"] <= 3:
                     if not full_source:
                         full_source = self.driver.page_source
                     search_start_vc = 0
@@ -3211,6 +3266,19 @@ class FacebookCrawler:
                 f"데이터 추출 완료: likes={result['likes']}, "
                 f"comments={result['comments']}, shares={result['shares']}"
             )
+
+            # 최종 안전장치: 모든 추출 시도 후에도 유효 데이터 없으면 에러 설정
+            has_any_data = (
+                result.get('likes', 0) > 0 or
+                result.get('comments', 0) > 0 or
+                result.get('shares', 0) > 0 or
+                result.get('views', 0) > 0
+            )
+            if not has_any_data and not result.get('error'):
+                logger.warning("모든 추출 시도 실패 - 삭제/비공개 게시물 가능성")
+                result["error"] = "게시물이 삭제되었거나 비공개 상태입니다"
+                result["error_type"] = "not_found"
+
             return result
 
         except TimeoutException:
@@ -3402,6 +3470,10 @@ class FacebookCrawler:
 
             # 타겟 포스트 ID 기반 스코핑 (추천 게시물 데이터 혼입 방지)
             search_source = self._scope_source_by_post_id(page_source, result.get("url", ""))
+
+            # 스코핑 결과 저장 (교차검증에서 활용)
+            self._last_scoped_source = search_source
+            self._scoping_succeeded = (search_source != page_source)
 
             # 반응 수 추출 (다양한 패턴 시도)
             reaction_patterns = [

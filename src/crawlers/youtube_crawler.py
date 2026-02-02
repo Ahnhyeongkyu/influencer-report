@@ -414,6 +414,19 @@ class YouTubeCrawler:
                 result = self.crawl_video(url)
                 results.append(result)
 
+            except YouTubeVideoNotFoundError as e:
+                logger.warning(f"동영상 없음/비공개 ({url}): {e}")
+                if continue_on_error:
+                    results.append({
+                        "platform": "youtube",
+                        "url": url,
+                        "error": "동영상이 삭제되었거나 비공개 상태입니다",
+                        "error_type": "not_found",
+                        "crawled_at": datetime.now().isoformat(),
+                    })
+                else:
+                    raise
+
             except Exception as e:
                 logger.error(f"크롤링 실패 ({url}): {e}")
 
