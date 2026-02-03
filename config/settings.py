@@ -137,10 +137,10 @@ class AppSettings:
     APP_TITLE: str = "인플루언서 캠페인 성과 리포트"
     APP_ICON: str = "📊"
 
-    # 인증 설정
+    # 인증 설정 (환경 변수 필수 — 하드코딩 금지)
     AUTH_ENABLED: bool = True
-    AUTH_USERNAME: str = os.getenv("APP_USERNAME", "admin")
-    AUTH_PASSWORD: str = os.getenv("APP_PASSWORD", "your_secure_password")
+    AUTH_USERNAME: str = os.getenv("APP_USERNAME", "")
+    AUTH_PASSWORD: str = os.getenv("APP_PASSWORD", "")
 
     # 세션 만료 시간 (초)
     SESSION_TIMEOUT: int = 3600  # 1시간

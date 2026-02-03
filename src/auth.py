@@ -14,9 +14,8 @@ import streamlit as st
 
 logger = logging.getLogger(__name__)
 
-# 환경 변수에서 인증 정보 로드
-DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = "your_secure_password"
+# 환경 변수에서 인증 정보 로드 (하드코딩 금지)
+_REQUIRED_ENV_VARS = ("APP_USERNAME", "APP_PASSWORD")
 
 
 def get_credentials() -> Tuple[str, str]:
@@ -25,9 +24,19 @@ def get_credentials() -> Tuple[str, str]:
 
     Returns:
         (username, password)
+
+    Raises:
+        RuntimeError: 환경 변수 미설정 시
     """
-    username = os.getenv("APP_USERNAME", DEFAULT_USERNAME)
-    password = os.getenv("APP_PASSWORD", DEFAULT_PASSWORD)
+    username = os.getenv("APP_USERNAME")
+    password = os.getenv("APP_PASSWORD")
+    if not username or not password:
+        missing = [v for v in _REQUIRED_ENV_VARS if not os.getenv(v)]
+        logger.error(f"필수 환경 변수 미설정: {missing}")
+        raise RuntimeError(
+            f"인증에 필요한 환경 변수가 설정되지 않았습니다: {', '.join(missing)}. "
+            "APP_USERNAME, APP_PASSWORD 환경 변수를 설정하세요."
+        )
     return username, password
 
 

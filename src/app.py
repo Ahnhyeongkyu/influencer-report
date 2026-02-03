@@ -329,7 +329,7 @@ def render_url_preview():
                     st.markdown(f'<span class="status-error">오류</span>', unsafe_allow_html=True)
             with col3:
                 if url_info.get("error"):
-                    st.markdown(f'<span class="status-error">{url_info.get("error")}</span>', unsafe_allow_html=True)
+                    st.error(url_info.get("error"))
 
     # 크롤링 시작 버튼
     st.markdown("---")
