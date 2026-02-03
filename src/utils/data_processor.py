@@ -112,8 +112,17 @@ def aggregate_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "avg_engagement": 0,
         }
 
-    success_results = [r for r in results if "error" not in r]
-    error_results = [r for r in results if "error" in r]
+    def _is_valid(r):
+        """에러 없고, 최소 1개 데이터 지표가 있는지 확인"""
+        if r.get("error"):
+            return False
+        return bool(
+            r.get("author") or (r.get("likes") or 0) > 0
+            or (r.get("comments") or 0) > 0 or (r.get("views") or 0) > 0
+            or (r.get("favorites") or 0) > 0 or (r.get("shares") or 0) > 0
+        )
+    success_results = [r for r in results if _is_valid(r)]
+    error_results = [r for r in results if not _is_valid(r)]
 
     total_likes = sum(safe_int(r.get("likes")) for r in success_results)
     total_comments = sum(safe_int(r.get("comments")) for r in success_results)

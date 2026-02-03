@@ -295,7 +295,7 @@ def render_platform_cookie_input(platform: str):
             if st.button("초기화", key=f"clear_{platform}", use_container_width=True):
                 set_platform_cookies(platform, {})
                 # 파일도 삭제 (크롤러와 동일한 파일명)
-                cookie_file = Path("data/cookies") / f"{platform}_cookies.json"
+                cookie_file = Path(__file__).parent.parent / "data" / "cookies" / f"{platform}_cookies.json"
                 if cookie_file.exists():
                     cookie_file.unlink()
                 st.info("쿠키가 초기화되었습니다.")
@@ -478,7 +478,7 @@ def browser_login(platform: str, timeout: int = 120) -> Dict[str, str]:
         if driver:
             try:
                 driver.quit()
-            except:
+            except Exception:
                 pass
 
     return saved_cookies
@@ -486,7 +486,7 @@ def browser_login(platform: str, timeout: int = 120) -> Dict[str, str]:
 
 def save_cookies_to_file(platform: str, cookies: Dict[str, str]):
     """쿠키를 파일로 저장 (크롤러와 동일한 파일명 사용)"""
-    cookie_dir = Path("data/cookies")
+    cookie_dir = Path(__file__).parent.parent / "data" / "cookies"
     cookie_dir.mkdir(parents=True, exist_ok=True)
     # 크롤러와 동일한 파일명 사용: {platform}_cookies.json
     cookie_file = cookie_dir / f"{platform}_cookies.json"
@@ -519,7 +519,7 @@ def save_cookies_to_file(platform: str, cookies: Dict[str, str]):
 
 def load_cookies_from_file(platform: str) -> Dict[str, str]:
     """파일에서 쿠키 로드 (크롤러와 동일한 파일명 사용)"""
-    cookie_file = Path("data/cookies") / f"{platform}_cookies.json"
+    cookie_file = Path(__file__).parent.parent / "data" / "cookies" / f"{platform}_cookies.json"
 
     if cookie_file.exists():
         try:
@@ -531,7 +531,7 @@ def load_cookies_from_file(platform: str) -> Dict[str, str]:
                 return {c.get("name"): c.get("value") for c in data if c.get("name")}
             # 이미 딕셔너리면 그대로 반환
             return data
-        except:
+        except Exception:
             pass
 
     return {}

@@ -55,7 +55,7 @@ def hash_password(password: str) -> str:
 
 def verify_credentials(username: str, password: str) -> bool:
     """
-    사용자 인증 확인
+    사용자 인증 확인 (해시 비교)
 
     Args:
         username: 입력된 사용자명
@@ -64,12 +64,31 @@ def verify_credentials(username: str, password: str) -> bool:
     Returns:
         인증 성공 여부
     """
+    import hmac
     valid_username, valid_password = get_credentials()
 
-    if username == valid_username and password == valid_password:
-        return True
+    # 타이밍 공격 방지를 위해 hmac.compare_digest 사용
+    username_match = hmac.compare_digest(username.encode(), valid_username.encode())
+    password_match = hmac.compare_digest(password.encode(), valid_password.encode())
 
-    return False
+    return username_match and password_match
+
+
+def _check_rate_limit() -> bool:
+    """로그인 시도 횟수 제한 확인. 5회 실패 시 60초 잠금."""
+    now = datetime.now()
+    attempts = st.session_state.get("_login_attempts", [])
+    # 60초 이내 시도만 유지
+    attempts = [t for t in attempts if now - t < timedelta(seconds=60)]
+    st.session_state._login_attempts = attempts
+    return len(attempts) < 5
+
+
+def _record_failed_attempt():
+    """실패한 로그인 시도 기록."""
+    if "_login_attempts" not in st.session_state:
+        st.session_state._login_attempts = []
+    st.session_state._login_attempts.append(datetime.now())
 
 
 def init_session_state():
@@ -200,11 +219,15 @@ def show_login_form():
             )
 
             if submitted:
-                if username and password:
+                if not _check_rate_limit():
+                    st.error("로그인 시도 횟수를 초과했습니다. 잠시 후 다시 시도하세요.")
+                elif username and password:
                     if login(username, password):
+                        st.session_state._login_attempts = []
                         st.success("로그인 성공!")
                         st.rerun()
                     else:
+                        _record_failed_attempt()
                         st.error("사용자명 또는 비밀번호가 올바르지 않습니다.")
                 else:
                     st.warning("사용자명과 비밀번호를 입력하세요.")

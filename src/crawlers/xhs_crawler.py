@@ -1060,7 +1060,7 @@ class XHSCrawler:
                                 "author": author_el.text.strip(),
                                 "text": text_el.text.strip()
                             })
-                    except:
+                    except Exception:
                         pass
                 if comments_list:
                     logger.info(f"DOM에서 댓글 {len(comments_list)}개 추출")
@@ -1149,7 +1149,7 @@ class XHSCrawler:
             try:
                 has_sign = self.driver.execute_script("return typeof window._webmsxyw")
                 logger.info(f"_webmsxyw 타입: {has_sign}")
-            except:
+            except Exception:
                 pass
             return None
 

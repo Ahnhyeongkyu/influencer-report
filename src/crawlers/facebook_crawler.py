@@ -2655,11 +2655,11 @@ class FacebookCrawler:
                                         clicked += 1
                                         logger.info(f"댓글 버튼 클릭: {selector[:50]}")
                                         time.sleep(2)
-                                except:
+                                except Exception:
                                     pass
                             if clicked >= 1:
                                 break
-                        except:
+                        except Exception:
                             pass
 
                     if clicked > 0:
@@ -2696,7 +2696,7 @@ class FacebookCrawler:
                                         self.driver.execute_script("arguments[0].click();", ac)
                                         logger.info("모든 댓글 선택")
                                         time.sleep(2)
-                                except:
+                                except Exception:
                                     pass
 
                             # 추가 스크롤
@@ -2725,14 +2725,14 @@ class FacebookCrawler:
                                             self.driver.execute_script("arguments[0].click();", btn)
                                             logger.info(f"더보기 클릭: {sel[:40]}")
                                             time.sleep(2)
-                                    except:
+                                    except Exception:
                                         pass
-                            except:
+                            except Exception:
                                 pass
 
                         # 댓글 로드 대기
                         time.sleep(3)
-                    except:
+                    except Exception:
                         pass
 
                     # 페이지 소스 새로 가져오기 (댓글 로드 후) - 모달 우선
@@ -2742,7 +2742,7 @@ class FacebookCrawler:
                         try:
                             page_source = modals[0].get_attribute('outerHTML')
                             logger.info("3단계: 모달 HTML만 사용 (피드 필터링)")
-                        except:
+                        except Exception:
                             page_source = self.driver.page_source
                     else:
                         page_source = self.driver.page_source
@@ -2900,7 +2900,7 @@ class FacebookCrawler:
                             if modals:
                                 search_context = modals[0]
                                 logger.info(f"모달 내에서 댓글 검색 시작")
-                        except:
+                        except Exception:
                             pass
 
                         # 숫자/통계 패턴 필터 함수
@@ -3046,7 +3046,7 @@ class FacebookCrawler:
                                                         container = parent
                                                         break
                                                     container = parent
-                                                except:
+                                                except Exception:
                                                     break
 
                                             # 작성자 찾기
@@ -3088,7 +3088,7 @@ class FacebookCrawler:
                                                     logger.info(f"댓글 추출 (답글버튼): author={author}, text={comment_text[:30]}...")
                                         except Exception as ce:
                                             continue
-                                except:
+                                except Exception:
                                     continue
 
                         if comments_list:
@@ -3112,7 +3112,7 @@ class FacebookCrawler:
                                             try:
                                                 author_elem = container.find_element(By.XPATH, ".//a[@role='link']//span[@dir='auto']")
                                                 author = author_elem.text.strip()
-                                            except:
+                                            except Exception:
                                                 pass
 
                                             # 컨테이너 내에서 댓글 텍스트 찾기
@@ -3133,7 +3133,7 @@ class FacebookCrawler:
                                                         if not any(skip in t.lower() for skip in skip_words):
                                                             text = t
                                                             break
-                                            except:
+                                            except Exception:
                                                 pass
 
                                             if text and len(text) > 10:
@@ -3163,7 +3163,7 @@ class FacebookCrawler:
                                                         break
                                         except Exception as ce:
                                             continue
-                                except:
+                                except Exception:
                                     continue
 
                         # 방법 2: 기존 방식 (작성자/텍스트 분리 추출) - fallback, 모달 내에서만 검색
@@ -3199,11 +3199,11 @@ class FacebookCrawler:
                                                         if not name.replace(',', '').replace('.', '').isdigit():
                                                             if name not in dom_author_names:
                                                                 dom_author_names.append(name)
-                                            except:
+                                            except Exception:
                                                 pass
-                                    except:
+                                    except Exception:
                                         pass
-                            except:
+                            except Exception:
                                 pass
 
                             dom_selectors = [
@@ -3244,9 +3244,9 @@ class FacebookCrawler:
                                                         })
                                                         if len(comments_list) >= 10:
                                                             break
-                                        except:
+                                        except Exception:
                                             continue
-                                except:
+                                except Exception:
                                     continue
 
                     if comments_list:

@@ -53,7 +53,7 @@ def decode_unicode_escapes(text: str) -> str:
             decoded = re.sub(r'\\u([0-9a-fA-F]{4})', replace_unicode, text)
             try:
                 decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-            except:
+            except Exception:
                 pass
         else:
             decoded = text
@@ -471,7 +471,7 @@ class DcardCrawler:
                             title_elem = await page.query_selector('title')
                             if title_elem:
                                 page_title = await page.evaluate('document.title')
-                        except:
+                        except Exception:
                             pass
 
                         # Cloudflare 통과 확인
@@ -594,7 +594,7 @@ class DcardCrawler:
                     """
                     await page.evaluate(js_click_more)
                     await asyncio.sleep(2)
-                except:
+                except Exception:
                     pass
 
                 # 3. 댓글 영역으로 스크롤
@@ -611,7 +611,7 @@ class DcardCrawler:
                     """
                     await page.evaluate(js_scroll_comments)
                     await asyncio.sleep(2)
-                except:
+                except Exception:
                     pass
 
                 # 4. 추가 스크롤로 더 많은 댓글 로드
@@ -877,7 +877,7 @@ class DcardCrawler:
                 if browser:
                     try:
                         await browser.stop()
-                    except:
+                    except Exception:
                         pass
 
         # 비동기 함수 실행 (재시도 포함)

@@ -49,7 +49,7 @@ def decode_unicode_escapes(text: str) -> str:
             # surrogate pair 처리
             try:
                 decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-            except:
+            except Exception:
                 pass
 
         # 추가 이스케이프 처리
@@ -1466,9 +1466,9 @@ class InstagramCrawler:
                                         btn.click()
                                         clicked_count += 1
                                         self._random_delay(1.5, 2.5)
-                                except:
+                                except Exception:
                                     pass
-                        except:
+                        except Exception:
                             pass
 
                     if clicked_count > 0:
@@ -1484,7 +1484,7 @@ class InstagramCrawler:
                             }
                         """)
                         self._random_delay(1, 2)
-                    except:
+                    except Exception:
                         pass
 
                     # === 3. 추가 "더 보기" 버튼 클릭 (댓글 내 접힌 텍스트 펼치기) ===
@@ -1498,9 +1498,9 @@ class InstagramCrawler:
                                 if btn.is_displayed():
                                     btn.click()
                                     self._random_delay(0.5, 1)
-                            except:
+                            except Exception:
                                 pass
-                    except:
+                    except Exception:
                         pass
 
                 except Exception as click_err:

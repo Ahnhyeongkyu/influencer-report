@@ -656,31 +656,53 @@ class PDFReportGenerator:
         BRAND_BORDER = colors.HexColor('#e2e8f0')       # 보더 컬러
         CARD_BG = colors.HexColor('#faf5ff')            # 연한 보라 배경
 
-        # 한글 폰트 등록
+        # 한글 폰트 등록 (크로스플랫폼)
         font_name = 'Helvetica'
         font_name_bold = 'Helvetica-Bold'
         try:
-            # Microsoft YaHei: 한국어+중국어+일본어 모두 지원
-            yh_path = "C:/Windows/Fonts/msyh.ttc"
-            yh_bold_path = "C:/Windows/Fonts/msyhbd.ttc"
-            font_path = "C:/Windows/Fonts/malgun.ttf"
-            font_path_bold = "C:/Windows/Fonts/malgunbd.ttf"
-
-            # Malgun Gothic (한국어 기본) + YaHei fallback 등록
-            if os.path.exists(yh_path):
-                pdfmetrics.registerFont(TTFont('MSYaHei', yh_path, subfontIndex=0))
-                if os.path.exists(yh_bold_path):
-                    pdfmetrics.registerFont(TTFont('MSYaHeiBold', yh_bold_path, subfontIndex=0))
-            if os.path.exists(font_path):
-                pdfmetrics.registerFont(TTFont('MalgunGothic', font_path))
-                font_name = 'MalgunGothic'
-                if os.path.exists(font_path_bold):
-                    pdfmetrics.registerFont(TTFont('MalgunGothicBold', font_path_bold))
-                    font_name_bold = 'MalgunGothicBold'
-                else:
-                    font_name_bold = font_name
+            import sys
+            font_candidates = []
+            if sys.platform == 'win32':
+                # Windows: Malgun Gothic (한국어) + MS YaHei (중국어)
+                font_candidates = [
+                    ("MalgunGothic", "C:/Windows/Fonts/malgun.ttf",
+                     "MalgunGothicBold", "C:/Windows/Fonts/malgunbd.ttf"),
+                ]
+                # YaHei fallback 등록
+                yh_path = "C:/Windows/Fonts/msyh.ttc"
+                yh_bold_path = "C:/Windows/Fonts/msyhbd.ttc"
+                if os.path.exists(yh_path):
+                    pdfmetrics.registerFont(TTFont('MSYaHei', yh_path, subfontIndex=0))
+                    if os.path.exists(yh_bold_path):
+                        pdfmetrics.registerFont(TTFont('MSYaHeiBold', yh_bold_path, subfontIndex=0))
             else:
-                logger.warning("한글 폰트를 찾을 수 없습니다.")
+                # Linux (Streamlit Cloud): Noto Sans CJK (packages.txt로 설치)
+                font_candidates = [
+                    ("NotoSansCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                     "NotoSansCJKBold", "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+                    ("NotoSansCJK", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                     "NotoSansCJKBold", "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"),
+                ]
+
+            for reg_name, reg_path, bold_name, bold_path in font_candidates:
+                if os.path.exists(reg_path):
+                    subfont = 0 if reg_path.endswith('.ttc') else None
+                    if subfont is not None:
+                        pdfmetrics.registerFont(TTFont(reg_name, reg_path, subfontIndex=subfont))
+                    else:
+                        pdfmetrics.registerFont(TTFont(reg_name, reg_path))
+                    font_name = reg_name
+                    if os.path.exists(bold_path):
+                        if subfont is not None:
+                            pdfmetrics.registerFont(TTFont(bold_name, bold_path, subfontIndex=subfont))
+                        else:
+                            pdfmetrics.registerFont(TTFont(bold_name, bold_path))
+                        font_name_bold = bold_name
+                    else:
+                        font_name_bold = font_name
+                    break
+            else:
+                logger.warning("한글 폰트를 찾을 수 없습니다. PDF에서 CJK 문자가 깨질 수 있습니다.")
         except Exception as e:
             logger.warning(f"폰트 등록 오류: {e}")
 

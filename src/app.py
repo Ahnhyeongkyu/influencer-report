@@ -324,7 +324,8 @@ def render_url_preview():
                 st.text(url_info.get("url", ""))
             with col2:
                 if url_info.get("valid"):
-                    st.markdown(f'<span class="status-success">{get_platform_display_name(url_info.get("platform", ""))}</span>', unsafe_allow_html=True)
+                    from html import escape as html_escape
+                    st.markdown(f'<span class="status-success">{html_escape(get_platform_display_name(url_info.get("platform", "")))}</span>', unsafe_allow_html=True)
                 else:
                     st.markdown(f'<span class="status-error">오류</span>', unsafe_allow_html=True)
             with col3:
@@ -484,15 +485,15 @@ def crawl_with_cookies(platform: str, url: str, auth_mode: bool = False) -> dict
         elif platform == "xiaohongshu":
             from src.crawlers.xhs_crawler import XHSCrawler
             # use_api=False로 QR 로그인 강제 (API는 잘못된 게시물 반환 가능)
-            with XHSCrawler(headless=False, use_api=False, collect_comments=True) as crawler_instance:
+            with XHSCrawler(headless=use_headless, use_api=False, collect_comments=True) as crawler_instance:
                 if cookies and crawler_instance.session:
                     apply_cookies_to_session(crawler_instance.session, cookies, domain)
                 return crawler_instance.crawl_post(url)
 
         elif platform == "dcard":
             from src.crawlers.dcard_crawler import DcardCrawler
-            # Dcard는 Cloudflare 우회를 위해 항상 브라우저 표시 (headless=False)
-            with DcardCrawler(headless=False, use_api=True) as crawler_instance:
+            # Cloud 환경에서는 headless 강제, 로컬에서는 use_headless 따름
+            with DcardCrawler(headless=use_headless, use_api=True) as crawler_instance:
                 if cookies and hasattr(crawler_instance, 'scraper'):
                     apply_cookies_to_session(crawler_instance.scraper, cookies, domain)
                 return crawler_instance.crawl_post(url)
