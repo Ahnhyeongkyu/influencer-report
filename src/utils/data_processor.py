@@ -235,6 +235,7 @@ def export_to_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
         "url",
         "author",
         "title",
+        "content",
         "likes",
         "comments",
         "shares",

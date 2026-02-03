@@ -339,9 +339,14 @@ class InstagramCrawler:
                 data = json.loads(shared_data_match.group(1))
                 media = self._find_media_in_shared_data(data)
                 if media:
-                    self._populate_result_from_media(result, media)
-                    if result.get('likes', 0) > 0 or result.get('author'):
-                        return result
+                    # shortcode 일치 검증 (다른 게시물 데이터 혼입 방지)
+                    media_sc = media.get('shortcode', '')
+                    if media_sc and media_sc != shortcode:
+                        logger.warning(f"sharedData shortcode 불일치: 요청={shortcode}, HTML={media_sc}")
+                    else:
+                        self._populate_result_from_media(result, media)
+                        if result.get('likes', 0) > 0 or result.get('author'):
+                            return result
 
             # 방법 2: __additionalDataLoaded에서 추출
             additional_match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);</script>', html)
@@ -349,11 +354,28 @@ class InstagramCrawler:
                 data = json.loads(additional_match.group(1))
                 media = self._find_media_in_additional_data(data)
                 if media:
-                    self._populate_result_from_media(result, media)
-                    if result.get('likes', 0) > 0 or result.get('author'):
-                        return result
+                    # shortcode 일치 검증
+                    media_sc = media.get('shortcode', '')
+                    if media_sc and media_sc != shortcode:
+                        logger.warning(f"additionalData shortcode 불일치: 요청={shortcode}, HTML={media_sc}")
+                    else:
+                        self._populate_result_from_media(result, media)
+                        if result.get('likes', 0) > 0 or result.get('author'):
+                            return result
 
-            # 방법 3: 정규식으로 직접 추출
+            # 방법 3: 정규식으로 직접 추출 (shortcode 스코핑 적용)
+            # HTML에서 타겟 shortcode 주변만 검색하여 다른 게시물 데이터 혼입 방지
+            search_html = html
+            if shortcode:
+                sc_pos = html.find(f'"{shortcode}"')
+                if sc_pos == -1:
+                    sc_pos = html.find(shortcode)
+                if sc_pos >= 0:
+                    start = max(0, sc_pos - 5000)
+                    end = min(len(html), sc_pos + 5000)
+                    search_html = html[start:end]
+                    logger.debug(f"regex 스코핑: shortcode '{shortcode}' 주변 {end - start} chars")
+
             patterns = {
                 'likes': [
                     r'"edge_media_preview_like"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
@@ -377,7 +399,7 @@ class InstagramCrawler:
 
             for key, pattern_list in patterns.items():
                 for pattern in pattern_list:
-                    match = re.search(pattern, html)
+                    match = re.search(pattern, search_html)
                     if match:
                         value = match.group(1)
                         if key in ['likes', 'comments', 'views']:
@@ -1242,6 +1264,20 @@ class InstagramCrawler:
         }
 
         try:
+            # SPA 캐시 완전 초기화 - 같은 작성자의 다른 게시물 데이터 혼입 방지
+            try:
+                # 1) 브라우저 캐시 및 스토리지 클리어 (CDP)
+                self.driver.execute_cdp_cmd('Network.clearBrowserCache', {})
+                self.driver.execute_script("window.sessionStorage.clear(); window.localStorage.clear();")
+            except Exception:
+                pass
+            try:
+                # 2) 빈 페이지로 이동하여 이전 페이지 DOM/JS 상태 완전 제거
+                self.driver.get("about:blank")
+                time.sleep(0.5)
+            except Exception:
+                pass
+
             # 게시물 페이지 로드
             self.driver.get(url)
             self._random_delay(5, 7)
@@ -1251,12 +1287,33 @@ class InstagramCrawler:
             expected_shortcode = self._extract_shortcode_from_url(url)
             if expected_shortcode and expected_shortcode not in current_url:
                 logger.warning(f"URL 불일치 감지! 요청: {url}, 현재: {current_url}")
-                # 페이지 새로고침 시도
+                # 강제 새 탭 수준의 리로드
+                self.driver.execute_cdp_cmd('Network.clearBrowserCache', {})
                 self.driver.get(url)
                 self._random_delay(5, 7)
                 current_url = self.driver.current_url
                 if expected_shortcode not in current_url:
                     logger.error(f"URL 불일치 지속 - 요청: {expected_shortcode}, 현재: {current_url}")
+
+            # 삭제/비공개 게시물 감지
+            try:
+                page_text = self.driver.page_source
+                not_found_indicators = [
+                    "이 페이지를 사용할 수 없습니다",
+                    "Sorry, this page isn't available",
+                    "The link you followed may be broken",
+                    "링크가 잘못되었을 수 있습니다",
+                    "This page isn't available",
+                    "Content Unavailable",
+                ]
+                for indicator in not_found_indicators:
+                    if indicator in page_text:
+                        logger.warning(f"삭제/비공개 게시물 감지: {indicator}")
+                        result["error"] = "게시물이 삭제되었거나 비공개 상태입니다"
+                        result["error_type"] = "not_found"
+                        return result
+            except Exception:
+                pass
 
             # 스크롤해서 동적 콘텐츠 로드 유도 (Instagram은 더 이상 article 태그 사용 안함)
             self.driver.execute_script("window.scrollTo(0, 500)")
@@ -1780,6 +1837,20 @@ class InstagramCrawler:
                 f"likes={result['likes']}, comments={result['comments']}, "
                 f"views={result['views']}, caption={'있음' if result.get('caption') else '없음'}"
             )
+
+            # 최종 안전장치: 모든 추출 시도 후에도 유효 데이터 없으면 에러 설정
+            has_any_data = (
+                result.get('author') or
+                result.get('likes', 0) > 0 or
+                result.get('comments', 0) > 0 or
+                (result.get('views') or 0) > 0 or
+                result.get('caption')
+            )
+            if not has_any_data and not result.get('error'):
+                logger.warning("모든 추출 시도 실패 - 삭제/비공개 게시물 가능성")
+                result["error"] = "게시물이 삭제되었거나 비공개 상태입니다"
+                result["error_type"] = "not_found"
+
             return result
 
         except TimeoutException:
