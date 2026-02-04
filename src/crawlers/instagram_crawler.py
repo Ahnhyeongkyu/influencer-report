@@ -27,38 +27,7 @@ import platform
 import requests
 
 
-def decode_unicode_escapes(text: str) -> str:
-    """유니코드 이스케이프 시퀀스를 디코딩 (\\uXXXX -> 실제 문자)
-
-    이모지 등 surrogate pair도 올바르게 처리합니다.
-    """
-    if not text:
-        return text
-    try:
-        # 방법 1: Python 내장 decode 사용 (surrogate pair 자동 처리)
-        # \\uXXXX 형식을 실제 이스케이프로 변환 후 디코딩
-        try:
-            decoded = text.encode('utf-8').decode('unicode_escape')
-            # surrogate pair가 있으면 UTF-16으로 재인코딩하여 해결
-            decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            # fallback: 수동 변환
-            def replace_unicode(match):
-                return chr(int(match.group(1), 16))
-            decoded = re.sub(r'\\u([0-9a-fA-F]{4})', replace_unicode, text)
-            # surrogate pair 처리
-            try:
-                decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-            except Exception:
-                pass
-
-        # 추가 이스케이프 처리
-        decoded = decoded.replace('\\n', '\n').replace('\\r', '\r')
-        decoded = decoded.replace('\\t', '\t').replace('\\"', '"')
-        decoded = decoded.replace('\\/', '/')
-        return decoded
-    except Exception:
-        return text
+from src.utils.text_utils import decode_unicode_escapes
 
 # httpx for better async support (optional)
 try:
@@ -151,6 +120,9 @@ class InstagramCrawler:
     MIN_REQUEST_DELAY = 3.0
     MAX_REQUEST_DELAY = 7.0
 
+    # GraphQL 쿼리 해시 (Instagram public API - 변경 시 업데이트 필요)
+    GRAPHQL_MEDIA_QUERY_HASH = "b3055c01b4b222b8a47dc12b090e4e64"
+
     # Instagram API 헤더
     API_HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -158,7 +130,7 @@ class InstagramCrawler:
         'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
         'Accept-Encoding': 'gzip, deflate, br',
         'Referer': 'https://www.instagram.com/',
-        'X-IG-App-ID': '936619743392459',  # Instagram Web App ID
+        'X-IG-App-ID': os.getenv('INSTAGRAM_APP_ID', '936619743392459'),
     }
 
     def __init__(
@@ -278,9 +250,17 @@ class InstagramCrawler:
             else:
                 logger.info("쿠키 없음 - 비로그인 상태로 시도")
 
-            # 페이지 HTML 요청
+            # 페이지 HTML 요청 (캐시 방지 — 동일 작성자 다중 게시물 혼입 방지)
             page_url = f"{self.BASE_URL}/p/{shortcode}/"
-            response = self.session.get(page_url, timeout=self.timeout)
+            cache_bust_headers = {
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0',
+            }
+            # CDN 캐시 우회를 위한 랜덤 쿼리 파라미터
+            import random as _rnd
+            bust_param = f"_cb={_rnd.randint(100000, 999999)}"
+            response = self.session.get(f"{page_url}?{bust_param}", timeout=self.timeout, headers=cache_bust_headers)
 
             if response.status_code != 200:
                 logger.warning(f"페이지 요청 실패: {response.status_code}")
@@ -293,7 +273,7 @@ class InstagramCrawler:
 
             # 1. script 태그에서 JSON 데이터 추출 시도
             result = self._extract_data_from_html(html, url, shortcode)
-            if result and (result.get('likes', 0) > 0 or result.get('author')):
+            if result and (result.get('likes', 0) > 0 or result.get('comments', 0) > 0):
                 return result
 
             # 2. GraphQL API 직접 호출 시도
@@ -365,16 +345,20 @@ class InstagramCrawler:
 
             # 방법 3: 정규식으로 직접 추출 (shortcode 스코핑 적용)
             # HTML에서 타겟 shortcode 주변만 검색하여 다른 게시물 데이터 혼입 방지
-            search_html = html
             if shortcode:
                 sc_pos = html.find(f'"{shortcode}"')
                 if sc_pos == -1:
                     sc_pos = html.find(shortcode)
-                if sc_pos >= 0:
-                    start = max(0, sc_pos - 5000)
-                    end = min(len(html), sc_pos + 5000)
-                    search_html = html[start:end]
-                    logger.debug(f"regex 스코핑: shortcode '{shortcode}' 주변 {end - start} chars")
+                if sc_pos < 0:
+                    # shortcode가 HTML에 없으면 regex 추출 불가 (다른 게시물 데이터 혼입 위험)
+                    logger.warning(f"shortcode '{shortcode}'이 HTML에 없음 - regex 추출 건너뜀")
+                    return None
+                start = max(0, sc_pos - 8000)
+                end = min(len(html), sc_pos + 8000)
+                search_html = html[start:end]
+                logger.debug(f"regex 스코핑: shortcode '{shortcode}' 주변 {end - start} chars")
+            else:
+                search_html = html
 
             patterns = {
                 'likes': [
@@ -408,7 +392,9 @@ class InstagramCrawler:
                             result[key] = value
                         break
 
-            return result if result.get('likes', 0) > 0 or result.get('author') else None
+            # username만 있고 수치 데이터가 없으면 유효하지 않음 (로그인 유저 username 혼입 방지)
+            has_metrics = result.get('likes', 0) > 0 or result.get('comments', 0) > 0 or result.get('views') is not None
+            return result if has_metrics else None
 
         except Exception as e:
             logger.debug(f"HTML 데이터 추출 실패: {e}")
@@ -453,7 +439,7 @@ class InstagramCrawler:
             # 캡션
             edges = media.get('edge_media_to_caption', {}).get('edges', [])
             if edges:
-                result['caption'] = edges[0].get('node', {}).get('text', '')[:500]
+                result['caption'] = edges[0].get('node', {}).get('text', '')[:2000]
 
             # 썸네일 이미지 추출
             thumbnail = media.get('display_url') or media.get('thumbnail_src')
@@ -492,7 +478,7 @@ class InstagramCrawler:
                         comment_text = decode_unicode_escapes(comment_text)
                         comments_list.append({
                             "author": comment_author,
-                            "text": comment_text[:200],  # 최대 200자
+                            "text": comment_text[:1000],
                             "likes": comment_likes,
                         })
 
@@ -505,9 +491,21 @@ class InstagramCrawler:
             logger.debug(f"미디어 데이터 파싱 실패: {e}")
             result['comments_list'] = []
 
+    @staticmethod
+    def _shortcode_to_media_id(shortcode: str) -> str:
+        """Instagram shortcode를 media_id(숫자)로 변환"""
+        alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+        media_id = 0
+        for char in shortcode:
+            media_id = media_id * 64 + alphabet.index(char)
+        return str(media_id)
+
     def _fetch_via_graphql(self, shortcode: str, url: str) -> Optional[Dict[str, Any]]:
         """
-        GraphQL API로 직접 데이터 가져오기
+        Instagram Mobile API로 데이터 가져오기 (2026 대응)
+
+        기존 GraphQL endpoint가 2026년부터 HTML을 반환하므로
+        i.instagram.com Mobile API를 우선 사용
 
         Args:
             shortcode: 게시물 shortcode
@@ -516,9 +514,70 @@ class InstagramCrawler:
         Returns:
             게시물 데이터 또는 None
         """
+        # 1. Mobile API (i.instagram.com) - 2026년 기준 가장 안정적
         try:
-            # GraphQL 쿼리 (Instagram public API)
-            query_hash = "b3055c01b4b222b8a47dc12b090e4e64"  # media query hash
+            media_id = self._shortcode_to_media_id(shortcode)
+            api_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
+            mobile_headers = {
+                'User-Agent': 'Instagram 275.0.0.27.98 Android',
+                'X-IG-App-ID': os.getenv('INSTAGRAM_APP_ID', '936619743392459'),
+                'Cache-Control': 'no-cache',
+            }
+
+            logger.info(f"Mobile API 요청: shortcode={shortcode}, media_id={media_id}")
+            response = self.session.get(api_url, timeout=self.timeout, headers=mobile_headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get('items', [])
+                if items:
+                    item = items[0]
+                    user = item.get('user', {})
+                    caption_data = item.get('caption') or {}
+
+                    result = {
+                        "platform": "instagram",
+                        "url": url,
+                        "shortcode": shortcode,
+                        "author": user.get('username'),
+                        "caption": (caption_data.get('text', '') if isinstance(caption_data, dict) else '')[:2000],
+                        "likes": item.get('like_count', 0),
+                        "comments": item.get('comment_count', 0),
+                        "views": item.get('play_count') or item.get('video_view_count'),
+                        "comments_list": [],
+                        "crawled_at": datetime.now().isoformat(),
+                    }
+
+                    # 썸네일
+                    image_versions = item.get('image_versions2', {})
+                    candidates = image_versions.get('candidates', [])
+                    if candidates:
+                        result['thumbnail'] = candidates[0].get('url')
+
+                    # 댓글 추출
+                    if self.collect_comments:
+                        comments_list = []
+                        preview_comments = item.get('preview_comments', [])
+                        for c in preview_comments[:self.max_comments]:
+                            c_user = c.get('user', {})
+                            c_text = c.get('text', '')
+                            if c_text:
+                                comments_list.append({
+                                    "author": c_user.get('username', 'user'),
+                                    "text": decode_unicode_escapes(c_text)[:1000],
+                                    "likes": c.get('comment_like_count', 0),
+                                })
+                        result['comments_list'] = comments_list
+
+                    logger.info(f"Mobile API 성공: likes={result['likes']}, comments={result['comments']}")
+                    return result
+
+        except Exception as e:
+            logger.debug(f"Mobile API 실패: {e}")
+
+        # 2. GraphQL fallback (레거시)
+        try:
+            query_hash = self.GRAPHQL_MEDIA_QUERY_HASH
             variables = json.dumps({
                 "shortcode": shortcode,
                 "child_comment_count": 3,
@@ -536,7 +595,10 @@ class InstagramCrawler:
             response = self.session.get(api_url, params=params, timeout=self.timeout)
 
             if response.status_code == 200:
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError:
+                    return None
                 media = data.get('data', {}).get('shortcode_media')
                 if media:
                     result = {
@@ -548,6 +610,7 @@ class InstagramCrawler:
                         "likes": 0,
                         "comments": 0,
                         "views": None,
+                        "comments_list": [],
                         "crawled_at": datetime.now().isoformat(),
                     }
                     self._populate_result_from_media(result, media)
@@ -1390,7 +1453,7 @@ class InstagramCrawler:
                     caption = caption_match.group(1)
                     caption = decode_unicode_escapes(caption)  # 유니코드 디코딩
                     if caption and len(caption) > 5:
-                        result["caption"] = caption[:500]
+                        result["caption"] = caption[:2000]
                         logger.info(f"JSON에서 캡션 추출: {caption[:50]}...")
                         break
 
@@ -1428,7 +1491,7 @@ class InstagramCrawler:
                         if comment_text:
                             comments_list.append({
                                 "author": comment_author,
-                                "text": comment_text[:200],
+                                "text": comment_text[:1000],
                                 "likes": 0
                             })
                         if len(comments_list) >= 10:
@@ -1534,14 +1597,20 @@ class InstagramCrawler:
                             seen_texts.add(text)
                             comments_list.append({
                                 "author": username,
-                                "text": text[:200],
+                                "text": text[:1000],
                                 "likes": 0
                             })
 
                     # 작성자명 있는 댓글이 부족하면 text만 추출 (fallback)
                     if len(comments_list) < 10:
+                        # 페이지 내 모든 username 수집 (이미 사용된 것 제외)
+                        all_usernames = re.findall(r'"username"\s*:\s*"([^"]+)"', page_source)
+                        used_authors = {c["author"] for c in comments_list}
+                        available_usernames = [u for u in all_usernames if u not in used_authors and len(u) > 1]
+
                         text_pattern = r'"text"\s*:\s*"((?:[^"\\]|\\.)+)"'
                         matches = re.findall(text_pattern, page_source)
+                        fallback_idx = 0
 
                         for match in matches:
                             if len(comments_list) >= 10:
@@ -1555,9 +1624,15 @@ class InstagramCrawler:
                                     continue
                                 if text.startswith('@') or len(text) >= 20:
                                     seen_texts.add(text)
+                                    # 가용한 username이 있으면 사용, 없으면 "user_N"
+                                    if fallback_idx < len(available_usernames):
+                                        author = available_usernames[fallback_idx]
+                                        fallback_idx += 1
+                                    else:
+                                        author = f"user_{len(comments_list) + 1}"
                                     comments_list.append({
-                                        "author": "user",
-                                        "text": text[:200],
+                                        "author": author,
+                                        "text": text[:1000],
                                         "likes": 0
                                     })
 
@@ -1658,7 +1733,7 @@ class InstagramCrawler:
                         # 유니코드 이스케이프 디코딩
                         caption = decode_unicode_escapes(caption)
                         if caption and len(caption) > 5:
-                            result["caption"] = caption[:500]
+                            result["caption"] = caption[:2000]
                             logger.info(f"JSON에서 캡션 추출: {caption[:50]}...")
                             break
             except Exception as e:
@@ -1688,7 +1763,7 @@ class InstagramCrawler:
                         caption_text = caption_elem.text.strip()
                         # 유효한 캡션인지 확인 (날짜, 좋아요 수 등 제외)
                         if caption_text and len(caption_text) > 5 and not caption_text.startswith('http') and not re.match(r'^\d+\s*(likes?|좋아요)', caption_text, re.IGNORECASE):
-                            result["caption"] = caption_text[:500]  # 최대 500자
+                            result["caption"] = caption_text[:2000]
                             break
                     except (NoSuchElementException, StaleElementReferenceException):
                         continue
@@ -1904,11 +1979,11 @@ class InstagramCrawler:
                     # 캡션
                     if "caption" in d and isinstance(d["caption"], dict):
                         if "text" in d["caption"]:
-                            result["caption"] = d["caption"]["text"][:500]
+                            result["caption"] = d["caption"]["text"][:2000]
                     elif "edge_media_to_caption" in d:
                         edges = d["edge_media_to_caption"].get("edges", [])
                         if edges and "node" in edges[0]:
-                            result["caption"] = edges[0]["node"].get("text", "")[:500]
+                            result["caption"] = edges[0]["node"].get("text", "")[:2000]
 
                     # 재귀적으로 탐색
                     for key, value in d.items():

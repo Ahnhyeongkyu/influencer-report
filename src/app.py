@@ -284,7 +284,8 @@ https://www.dcard.tw/f/xxx/p/xxxxx""",
                 st.success(f"{len(parsed)}개 URL이 CSV에서 추출되었습니다.")
                 st.rerun()
             except Exception as e:
-                st.error(f"CSV 파싱 오류: {e}")
+                logger.error(f"CSV 파싱 오류: {e}")
+                st.error("CSV 파일을 파싱할 수 없습니다. 파일 형식을 확인해주세요.")
 
 
 def render_url_preview():
@@ -503,10 +504,19 @@ def crawl_with_cookies(platform: str, url: str, auth_mode: bool = False) -> dict
 
     except Exception as e:
         logger.error(f"크롤링 오류 ({platform}, {url}): {e}")
+        error_msg = str(e)
+        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+            safe_error = "요청 시간 초과"
+        elif "connection" in error_msg.lower():
+            safe_error = "서버 연결 실패"
+        elif "cookie" in error_msg.lower() or "login" in error_msg.lower():
+            safe_error = "인증 필요 - 쿠키/로그인 확인"
+        else:
+            safe_error = error_msg[:100] if len(error_msg) <= 100 else error_msg[:100] + "..."
         return {
             "platform": platform,
             "url": url,
-            "error": str(e),
+            "error": safe_error,
             "crawled_at": datetime.now().isoformat(),
         }
 
@@ -1004,6 +1014,25 @@ def run_crawling():
 
                     try:
                         result = c.crawl_post(url)
+
+                        # 같은 작성자 다른 게시물 덮어쓰기 방지: 이전 결과와 완전 동일 데이터인지 확인
+                        if results and result.get("author") and not result.get("error"):
+                            prev_same_author = [
+                                r for r in results
+                                if r.get("author") == result.get("author")
+                                and r.get("platform") == result.get("platform")
+                                and r.get("url") != result.get("url")
+                                and r.get("likes") == result.get("likes")
+                                and r.get("comments") == result.get("comments")
+                            ]
+                            if prev_same_author:
+                                logger.warning(
+                                    f"동일 작성자 데이터 중복 감지: {result.get('author')}, URL={url[:50]}, "
+                                    f"likes={result.get('likes')}, comments={result.get('comments')} → 재크롤링 시도"
+                                )
+                                time.sleep(3)  # CDN 캐시 갱신 대기
+                                result = c.crawl_post(url)
+
                         results.append(result)
                         logger.info(f"{platform} 배치 결과: likes={result.get('likes')}, comments={result.get('comments')}")
 
@@ -1386,13 +1415,31 @@ def render_results():
         )
 
     with col2:
-        # Excel 다운로드
+        # Excel 다운로드 (결과 + 요약 + 댓글 시트 포함)
         try:
             from io import BytesIO
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='결과')
                 summary_df.to_excel(writer, index=False, sheet_name='요약')
+
+                # 댓글 시트 추가
+                comments_rows = []
+                for r in results:
+                    if r.get("comments_list"):
+                        for c in r["comments_list"]:
+                            comments_rows.append({
+                                "플랫폼": r.get("platform", ""),
+                                "게시물URL": r.get("url", ""),
+                                "게시물작성자": r.get("author", ""),
+                                "댓글작성자": c.get("author", ""),
+                                "댓글내용": c.get("text", ""),
+                                "좋아요": c.get("likes", 0),
+                            })
+                if comments_rows:
+                    comments_df = pd.DataFrame(comments_rows)
+                    comments_df.to_excel(writer, index=False, sheet_name='댓글')
+
             excel_data = output.getvalue()
 
             st.download_button(

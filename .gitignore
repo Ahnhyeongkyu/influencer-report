@@ -19,11 +19,24 @@ logs/
 *.html
 *.json
 *.txt
+*.csv
+*.pdf
+*.zip
+*.log
+*.bat
 !packages.txt
 !requirements.txt
 
+# Cookies / credentials
+data/cookies/
+*.cookie
+*.cookies
+
 # Claude
 .claude/
+
+# Delivery artifacts
+*_final.zip
 
 # Temp
 *.bak

@@ -50,7 +50,7 @@ def format_number(num: Optional[int]) -> str:
     Returns:
         포맷된 문자열 (예: 1,234 / 1.2만 / 1.5M)
     """
-    if num is None:
+    if num is None or num == 0:
         return "-"
 
     if not isinstance(num, (int, float)):
@@ -260,7 +260,10 @@ def export_to_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
         row = {col: result.get(col, None) for col in columns}
         # title이 없으면 content 또는 caption 사용
         if not row["title"]:
-            row["title"] = result.get("content") or result.get("caption", "")
+            row["title"] = result.get("content") or result.get("caption") or result.get("description") or ""
+        # content가 없으면 caption 또는 description 사용
+        if not row["content"]:
+            row["content"] = result.get("caption") or result.get("description") or ""
         rows.append(row)
 
     df = pd.DataFrame(rows, columns=columns)

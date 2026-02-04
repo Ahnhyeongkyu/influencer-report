@@ -584,6 +584,21 @@ class XHSCrawler:
                         result['title'] = title_text
                         break
 
+            # 내용(desc) 추출 — 표의 내용 컬럼에 저장
+            content_patterns = [
+                r'"noteDetailMap"[^}]*"desc"\s*:\s*"([^"]{10,})"',
+                r'"note"\s*:\s*\{[^}]*"desc"\s*:\s*"([^"]{10,})"',
+                r'"desc"\s*:\s*"([^"]{10,2000})"',
+            ]
+            for pattern in content_patterns:
+                match = re.search(pattern, html, re.DOTALL)
+                if match:
+                    content_text = match.group(1)
+                    if content_text and content_text.strip() not in placeholder_texts:
+                        from src.utils.text_utils import decode_unicode_escapes as _decode
+                        result['content'] = _decode(content_text)
+                        break
+
             # 썸네일 정규식 추출 (실제 콘텐츠 이미지 우선)
             if not result.get('thumbnail'):
                 thumbnail_patterns = [

@@ -23,48 +23,11 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
 
+from src.utils.text_utils import decode_unicode_escapes as _base_decode
+
 def decode_unicode_escapes(text: str) -> str:
-    """유니코드 이스케이프 시퀀스를 디코딩 (\\uXXXX -> 실제 문자)
-
-    이모지 등 surrogate pair도 올바르게 처리합니다.
-    UTF-8이 Latin-1로 잘못 해석된 경우도 수정합니다.
-    """
-    if not text:
-        return text
-    try:
-        # 1단계: UTF-8이 Latin-1로 잘못 해석된 경우 수정 시도
-        # 예: "ç¬¬ä¸æ¬¡è¦ç¶²å" -> "第一次覺網友" (중국어/대만어)
-        try:
-            fixed = text.encode('latin-1').decode('utf-8')
-            if fixed != text:
-                # Latin-1 수정 성공 - 기본 이스케이프만 처리하고 반환
-                fixed = fixed.replace('\\n', '\n').replace('\\r', '\r')
-                fixed = fixed.replace('\\t', '\t').replace('\\"', '"')
-                fixed = fixed.replace('\\/', '/')
-                return fixed
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            pass  # Latin-1 수정 불가, 다음 단계로
-
-        # 2단계: \uXXXX 패턴이 있는 경우 re.sub으로 안전하게 변환
-        # (unicode_escape 코덱 대신 re.sub 사용 - 중국어+이스케이프 혼합 텍스트에서도 안전)
-        if '\\u' in text:
-            def replace_unicode(match):
-                return chr(int(match.group(1), 16))
-            decoded = re.sub(r'\\u([0-9a-fA-F]{4})', replace_unicode, text)
-            try:
-                decoded = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-            except Exception:
-                pass
-        else:
-            decoded = text
-
-        # 기타 이스케이프 시퀀스 처리
-        decoded = decoded.replace('\\n', '\n').replace('\\r', '\r')
-        decoded = decoded.replace('\\t', '\t').replace('\\"', '"')
-        decoded = decoded.replace('\\/', '/')
-        return decoded
-    except Exception:
-        return text
+    """유니코드 이스케이프 디코딩 (Latin-1 복원 포함 - Dcard 전용)"""
+    return _base_decode(text, fix_latin1=True)
 
 # cloudscraper25 for Cloudflare v2/v3 bypass (enhanced fork)
 try:
@@ -372,13 +335,20 @@ class DcardCrawler:
                     # 댓글 내용 수집
                     comments_list = self._fetch_comments(post_id)
 
+                    # HTML 태그 제거 + 이미지 참조 정리 (u... 표시 방지)
+                    clean_content = decode_unicode_escapes(raw_content)
+                    clean_content = re.sub(r'<img[^>]*>', '[이미지]', clean_content)
+                    clean_content = re.sub(r'<br\s*/?>', '\n', clean_content, flags=re.IGNORECASE)
+                    clean_content = re.sub(r'<[^>]+>', '', clean_content)
+                    clean_content = clean_content.strip()
+
                     result = {
                         "platform": "dcard",
                         "url": f"{self.BASE_URL}/f/{data.get('forumAlias', 'all')}/p/{post_id}",
                         "post_id": str(post_id),
                         "author": data.get("school") or "Anonymous",
                         "title": decode_unicode_escapes(raw_title),
-                        "content": decode_unicode_escapes(raw_content),  # 게시물 본문 (유니코드 디코딩)
+                        "content": clean_content,  # 게시물 본문 (HTML 태그 제거)
                         "likes": data.get("likeCount", 0) or 0,
                         "comments": data.get("commentCount", 0) or 0,
                         "shares": data.get("shareCount"),
@@ -684,7 +654,7 @@ class DcardCrawler:
                                             if isinstance(c, dict) and c.get('content'):
                                                 found_comments.append({
                                                     'author': c.get('school') or 'Anonymous',
-                                                    'text': decode_unicode_escapes(c['content'])[:200],
+                                                    'text': decode_unicode_escapes(c['content'])[:1000],
                                                     'likes': c.get('likeCount', 0) or 0,
                                                 })
                                     for v in obj.values():
@@ -752,7 +722,7 @@ class DcardCrawler:
                                             if raw_content:
                                                 comments_list.append({
                                                     'author': comment.get('school') or 'Anonymous',
-                                                    'text': decode_unicode_escapes(raw_content)[:200],
+                                                    'text': decode_unicode_escapes(raw_content)[:1000],
                                                     'likes': comment.get('likeCount', 0) or 0,
                                                 })
                                     if comments_list:
@@ -834,7 +804,7 @@ class DcardCrawler:
                                 if c_text and len(c_text) > 5:
                                     comments_list.append({
                                         'author': 'Anonymous',
-                                        'text': decode_unicode_escapes(c_text)[:200]
+                                        'text': decode_unicode_escapes(c_text)[:1000]
                                     })
                         if comments_list:
                             logger.info(f"JSON 패턴에서 댓글 {len(comments_list)}개 수집")

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from jinja2 import Environment, FileSystemLoader
+from src.utils.data_processor import format_number, safe_int
 
 logger = logging.getLogger(__name__)
 
@@ -113,46 +114,12 @@ PLATFORM_NAMES_KR = {
 # Dcard: 조회수 비공개
 
 
-def format_number(num: Optional[int]) -> str:
-    """
-    숫자를 읽기 쉬운 형태로 포맷
-
-    Args:
-        num: 포맷할 숫자
-
-    Returns:
-        포맷된 문자열
-    """
-    if num is None or num == 0:
-        return "-"
-
-    if not isinstance(num, (int, float)):
-        return str(num)
-
-    num = int(num)
-
-    if num >= 100000000:
-        return f"{num / 100000000:.1f}억"
-    elif num >= 10000:
-        return f"{num / 10000:.1f}만"
-    elif num >= 1000:
-        return f"{num:,}"
-    else:
-        return str(num)
-
-
 def format_metric(value: Any) -> str:
     """
     지표 표시 (실제 데이터 유무로 판단)
     - None → 수집 불가 (해당 플랫폼/게시물에서 제공 안 함)
     - 0 → -
     - 숫자 → 포맷팅
-
-    Args:
-        value: 지표 값
-
-    Returns:
-        포맷된 문자열
     """
     if value is None:
         return "수집 불가"
@@ -162,25 +129,6 @@ def format_metric(value: Any) -> str:
 def format_views_for_platform(views: Optional[int], platform: str) -> str:
     """조회수 표시 (하위 호환용)"""
     return format_metric(views)
-
-
-def safe_int(value: Any, default: int = 0) -> int:
-    """
-    안전하게 정수로 변환
-
-    Args:
-        value: 변환할 값
-        default: 변환 실패 시 기본값
-
-    Returns:
-        정수 값
-    """
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return default
 
 
 def wrap_cjk_font(text: str, cjk_font: str = 'MSYaHei') -> str:

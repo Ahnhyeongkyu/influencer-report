@@ -230,7 +230,8 @@ def render_platform_cookie_input(platform: str):
                     else:
                         st.error("❌ 로그인 타임아웃. 2분 내에 로그인을 완료해주세요.")
                 except Exception as e:
-                    st.error(f"❌ 브라우저 로그인 오류: {str(e)}")
+                    logger.error(f"브라우저 로그인 상세 오류: {e}")
+                    st.error("❌ 브라우저 로그인 중 오류가 발생했습니다. 다시 시도해주세요.")
                     st.info("💡 Chrome 브라우저가 설치되어 있는지 확인해주세요.")
 
     elif platform == "xiaohongshu":
@@ -513,6 +514,13 @@ def save_cookies_to_file(platform: str, cookies: Dict[str, str]):
 
     with open(cookie_file, "w", encoding="utf-8") as f:
         json.dump(selenium_cookies, f, indent=2, ensure_ascii=False)
+
+    # 쿠키 파일 권한 제한 (소유자만 읽기/쓰기 - Linux/Mac)
+    try:
+        import stat
+        os.chmod(cookie_file, stat.S_IRUSR | stat.S_IWUSR)
+    except (OSError, AttributeError):
+        pass  # Windows에서는 Unix 권한 미지원
 
     logger.info(f"쿠키 파일 저장: {cookie_file} ({len(selenium_cookies)}개)")
 
