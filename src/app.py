@@ -944,11 +944,11 @@ def run_crawling():
         domain = PLATFORM_DOMAINS.get(platform, "")
         has_cookies = bool(cookies)
 
-        # headless 모드 결정 (Dcard는 항상 브라우저 표시)
-        if platform == "dcard":
-            use_headless = False
-        elif IS_CLOUD:
+        # headless 모드 결정 (Cloud 환경 우선)
+        if IS_CLOUD:
             use_headless = True
+        elif platform == "dcard" and not auth_mode:
+            use_headless = False  # Dcard: Cloudflare 우회 위해 브라우저 표시 (로컬만)
         elif auth_mode:
             use_headless = False
         elif has_cookies:
@@ -984,7 +984,7 @@ def run_crawling():
                 )
             else:  # dcard
                 from src.crawlers.dcard_crawler import DcardCrawler
-                crawler_instance = DcardCrawler(headless=False, use_api=True)
+                crawler_instance = DcardCrawler(headless=use_headless, use_api=True)
 
             with crawler_instance as c:
                 # 쿠키 적용 (세션 시작 시 한 번만)
