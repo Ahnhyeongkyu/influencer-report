@@ -535,12 +535,15 @@ class InstagramCrawler:
                     user = item.get('user', {})
                     caption_data = item.get('caption') or {}
 
+                    caption_text = (caption_data.get('text', '') if isinstance(caption_data, dict) else '')[:2000]
                     result = {
                         "platform": "instagram",
                         "url": url,
                         "shortcode": shortcode,
                         "author": user.get('username'),
-                        "caption": (caption_data.get('text', '') if isinstance(caption_data, dict) else '')[:2000],
+                        "caption": caption_text,
+                        "content": caption_text,
+                        "title": caption_text.split('\n')[0][:100] if caption_text else None,
                         "likes": item.get('like_count', 0),
                         "comments": item.get('comment_count', 0),
                         "views": item.get('play_count') or item.get('video_view_count'),
@@ -607,6 +610,8 @@ class InstagramCrawler:
                         "shortcode": shortcode,
                         "author": None,
                         "caption": None,
+                        "content": None,
+                        "title": None,
                         "likes": 0,
                         "comments": 0,
                         "views": None,
@@ -614,6 +619,9 @@ class InstagramCrawler:
                         "crawled_at": datetime.now().isoformat(),
                     }
                     self._populate_result_from_media(result, media)
+                    if result.get("caption") and not result.get("content"):
+                        result["content"] = result["caption"]
+                        result["title"] = result["caption"].split('\n')[0][:100]
                     return result
 
         except Exception as e:

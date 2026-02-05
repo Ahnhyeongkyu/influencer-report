@@ -7,6 +7,7 @@ Streamlit 앱을 위한 간단한 세션 기반 인증
 import os
 import hashlib
 import logging
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
@@ -16,6 +17,20 @@ logger = logging.getLogger(__name__)
 
 # 환경 변수에서 인증 정보 로드 (하드코딩 금지)
 _REQUIRED_ENV_VARS = ("APP_USERNAME", "APP_PASSWORD")
+
+# config/.env 파일에서 환경 변수 자동 로드
+_env_file = Path(__file__).resolve().parent.parent / "config" / ".env"
+if _env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+    except ImportError:
+        # python-dotenv 없으면 직접 파싱
+        for line in _env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip())
 
 
 def get_credentials() -> Tuple[str, str]:

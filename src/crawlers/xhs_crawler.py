@@ -1268,8 +1268,16 @@ class XHSCrawler:
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             time.sleep(3)
-            logger.info(f"현재 URL: {self.driver.current_url}")
+            current_url = self.driver.current_url
+            logger.info(f"현재 URL: {current_url}")
             logger.info(f"페이지 제목: {self.driver.title}")
+
+            # === 리다이렉트 감지: note_id가 URL에 없으면 삭제/비공개 ===
+            if note_id and note_id not in current_url:
+                logger.warning(f"리다이렉트 감지: {url} → {current_url} (note_id '{note_id}' 없음)")
+                result["error"] = "게시물이 삭제되었거나 비공개 상태입니다"
+                result["error_type"] = "redirect_detected"
+                return result
 
             # === DOM 구조 덤프 (디버그) ===
             try:

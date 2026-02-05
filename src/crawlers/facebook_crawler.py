@@ -1012,8 +1012,8 @@ class FacebookCrawler:
         if not text:
             return False
         return bool(re.search(
-            r'\d+\s*(시간|분|일|초|주|개월|년)\s*전|'
-            r'\d+\s*(hour|min|day|sec|week|month|year)s?\s*ago|'
+            r'\d+\s*(시간|분|일|초|주|개월|년)(\s*전)?|'
+            r'\d+\s*(hour|min|day|sec|week|month|year)s?(\s*ago)?|'
             r'(어제|오늘|그저께|방금|yesterday|today|just\s*now)',
             text, re.IGNORECASE
         ))
@@ -1135,12 +1135,28 @@ class FacebookCrawler:
                 for elem in elements:
                     text = elem.text.strip()
                     if text:
+                        # 시간/날짜 텍스트 필터링 (예: "3주", "5시간 전" 등)
+                        if self._is_time_text(text):
+                            logger.debug(f"XPath 댓글 추출: 시간 텍스트 건너뜀 ({text[:30]})")
+                            continue
                         count = self._parse_count(text)
                         if count > 0:
                             logger.info(f"XPath로 댓글 수 추출: {count} (from: {text[:30]})")
                             return count
             except (NoSuchElementException, StaleElementReferenceException):
                 continue
+
+        # aria-label fallback: 개별 댓글 aria-label 카운팅 ("N전에 X님이 남긴 댓글")
+        try:
+            comment_labels = driver.find_elements(
+                By.XPATH, "//*[contains(@aria-label, '님이 남긴 댓글') or contains(@aria-label, 'comment by')]"
+            )
+            if comment_labels:
+                count = len(comment_labels)
+                logger.info(f"aria-label에서 댓글 수 추정: {count}개 (보이는 댓글 기준)")
+                return count
+        except Exception:
+            pass
 
         return 0
 
@@ -1686,6 +1702,9 @@ class FacebookCrawler:
             r'^알림$',           # 한국어 "알림"
             r'^search$',        # Search
             r'^검색$',           # 한국어 "검색"
+            r'^프로필\d*$',      # 한국어 "프로필", "프로필0" 등
+            r'^profile\d*$',    # 영어 "Profile", "Profile0" 등
+            r'^내\s*프로필$',    # "내 프로필"
         ]
         for pattern in fb_generic_patterns:
             if re.search(pattern, name.strip(), re.IGNORECASE):
@@ -1939,6 +1958,14 @@ class FacebookCrawler:
             self._last_scoped_source = None
             self._scoping_succeeded = False
 
+            # 브라우저 캐시 초기화 (이전 포스트 데이터 오염 방지)
+            try:
+                self.driver.get("about:blank")
+                self.driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+                time.sleep(1)
+            except Exception:
+                pass
+
             # Rate limiting 적용
             self._rate_limit()
 
@@ -1954,6 +1981,13 @@ class FacebookCrawler:
 
             # 추가 대기 (동적 콘텐츠 로드) - Watch 동영상용 충분한 대기
             time.sleep(5)
+
+            # share URL 리다이렉트 확인 (로그인된 브라우저에서 JS 리다이렉트 발생)
+            current_url = self.driver.current_url
+            if "/share/" in url and current_url != url and "/share/" not in current_url:
+                logger.info(f"share URL 리다이렉트 감지: {url[:60]} → {current_url[:80]}")
+                url = current_url
+                result["url"] = current_url
 
             # 스크롤해서 콘텐츠 로드 유도 (여러 번 스크롤)
             for scroll_y in [300, 600, 900]:
@@ -3573,29 +3607,21 @@ class FacebookCrawler:
 
         # share/v 단축 URL 처리 - 실제 URL로 리다이렉트
         original_url = url
-        if "/share/v/" in url or "/share/p/" in url or "/share/r/" in url:
+        is_share_url = "/share/v/" in url or "/share/p/" in url or "/share/r/" in url
+        if is_share_url:
             logger.info(f"Facebook 단축 URL 감지, 리다이렉트 처리: {url}")
             try:
-                # requests로 리다이렉트 따라가기 (최대 5회 리다이렉트, 15초 총 타임아웃)
+                # requests로 리다이렉트 따라가기
                 response = requests.head(url, allow_redirects=True, timeout=15,
                     headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-                if response.url and response.url != url:
+                if response.url and response.url != url and "/share/" not in response.url:
                     url = response.url
+                    is_share_url = False
                     logger.info(f"리다이렉트된 URL: {url}")
+                else:
+                    logger.info(f"requests 리다이렉트 미발생 (JS 기반), 로그인 후 Selenium에서 처리")
             except Exception as e:
-                logger.warning(f"리다이렉트 처리 실패, 원본 URL 사용: {e}")
-                # Selenium fallback은 로컬에서만 (Cloud에서는 원본 URL 사용)
-                if not IS_CLOUD:
-                    if self.driver is None:
-                        self.driver = self._create_driver()
-                    try:
-                        self.driver.set_page_load_timeout(15)
-                        self.driver.get(original_url)
-                        time.sleep(3)
-                        url = self.driver.current_url
-                        logger.info(f"Selenium 리다이렉트 URL: {url}")
-                    except Exception as e2:
-                        logger.warning(f"Selenium 리다이렉트도 실패: {e2}")
+                logger.warning(f"리다이렉트 처리 실패, 로그인 후 Selenium에서 처리: {e}")
 
         # 1. API 방식 우선 시도 (쿠키 인증 포함)
         if self.use_api and self.session:
@@ -3603,6 +3629,30 @@ class FacebookCrawler:
             result = self._crawl_via_api(url)
             if result and (result.get('likes', 0) > 0 or result.get('author')):
                 logger.info(f"API 크롤링 성공: likes={result.get('likes')}, author={result.get('author')}")
+                # API 경로는 thumbnail이 없으므로 별도로 og:image 추출
+                if not result.get('thumbnail'):
+                    try:
+                        thumb_resp = self.session.get(
+                            url, timeout=10,
+                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                        )
+                        if thumb_resp.status_code == 200:
+                            og_match = re.search(
+                                r'<meta\s+property=["\']og:image["\']\s+content=["\'](https?://[^"\']+)',
+                                thumb_resp.text, re.IGNORECASE
+                            )
+                            if not og_match:
+                                og_match = re.search(
+                                    r'content=["\'](https?://[^"\']+)["\'].*?property=["\']og:image',
+                                    thumb_resp.text, re.IGNORECASE
+                                )
+                            if og_match:
+                                thumb = og_match.group(1)
+                                if thumb and ('fbcdn' in thumb or 'facebook' in thumb) and 'emoji' not in thumb:
+                                    result['thumbnail'] = thumb
+                                    logger.info(f"API 경로에서 og:image 썸네일 추출: {thumb[:60]}...")
+                    except Exception as e:
+                        logger.debug(f"API 경로 썸네일 추출 실패: {e}")
                 return self._sanitize_result(result)
             logger.info("API 방식 실패, facebook-scraper fallback 시도...")
 
@@ -3654,7 +3704,35 @@ class FacebookCrawler:
                 raise FacebookLoginError("로그인에 실패했습니다.")
 
         # 게시물 데이터 추출
-        return self._sanitize_result(self._extract_post_data_from_page(url))
+        result = self._sanitize_result(self._extract_post_data_from_page(url))
+
+        # 썸네일 후처리: 어떤 경로든 thumbnail이 없으면 별도 requests로 og:image 추출
+        if result and not result.get('thumbnail'):
+            try:
+                thumb_url = result.get('url') or url
+                thumb_resp = requests.get(
+                    thumb_url, timeout=10, allow_redirects=True,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                )
+                if thumb_resp.status_code == 200:
+                    og_match = re.search(
+                        r'<meta\s+property=["\']og:image["\']\s+content=["\'](https?://[^"\']+)',
+                        thumb_resp.text, re.IGNORECASE
+                    )
+                    if not og_match:
+                        og_match = re.search(
+                            r'content=["\'](https?://[^"\']+)["\'].*?property=["\']og:image',
+                            thumb_resp.text, re.IGNORECASE
+                        )
+                    if og_match:
+                        thumb = og_match.group(1)
+                        if thumb and ('fbcdn' in thumb or 'facebook' in thumb) and 'emoji' not in thumb:
+                            result['thumbnail'] = thumb
+                            logger.info(f"후처리에서 og:image 썸네일 추출: {thumb[:60]}...")
+            except Exception as e:
+                logger.debug(f"썸네일 후처리 실패: {e}")
+
+        return result
 
     def crawl_posts(
         self,
