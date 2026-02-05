@@ -171,6 +171,7 @@ class FacebookCrawler:
         self.is_logged_in = False
         self._last_request_time = 0
         self.session: Optional[requests.Session] = None
+        self._used_thumbnails: set = set()  # 썸네일 중복 감지용
 
         # 쿠키 디렉토리 생성
         self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1207,24 +1208,51 @@ class FacebookCrawler:
                 logger.info(f"JSON에서 댓글 {len(comments)}개 추출")
                 return comments
 
-            # 2. DOM에서 댓글 요소 직접 추출
-            comment_selectors = [
-                "//div[contains(@class, 'comment')]//div[contains(@dir, 'auto')]",
-                "//div[@data-sigil='comment-body']",
-                "//div[contains(@class, '_2b05')]",  # 모바일 댓글
-                "//span[contains(@class, '_3l3x')]",  # 데스크톱 댓글
+            # 2. DOM에서 답글 버튼 기준 댓글 추출 (2026 Facebook DOM 대응)
+            reply_selectors = [
+                "//span[text()='답글 달기']",
+                "//span[text()='Reply']",
             ]
-
-            for selector in comment_selectors:
+            for reply_sel in reply_selectors:
                 try:
-                    elements = driver.find_elements(By.XPATH, selector)
-                    for elem in elements[:max_comments]:
-                        text = elem.text.strip()
-                        if text and len(text) > 1:
-                            comments.append({
-                                "author": "Facebook 사용자",
-                                "text": text
-                            })
+                    reply_btns = driver.find_elements(By.XPATH, reply_sel)
+                    for btn in reply_btns[:max_comments]:
+                        try:
+                            container = btn
+                            for _ in range(8):
+                                try:
+                                    container = container.find_element(By.XPATH, '..')
+                                except Exception:
+                                    break
+                            ct = (container.text or '').strip()
+                            if not ct:
+                                continue
+                            lines = [l.strip() for l in ct.split('\n') if l.strip()]
+                            ui_kw = ['좋아요', '답글 달기', '공유', '더 보기', '번역 보기',
+                                     'Like', 'Reply', 'Share', 'See more', 'Translate']
+                            time_pat = re.compile(r'^\d+\s*(초|분|시간|일|주|개월|년|sec|min|hour|day|week|month|year)', re.IGNORECASE)
+                            author = None
+                            text_parts = []
+                            for idx, line in enumerate(lines):
+                                if any(line == kw for kw in ui_kw):
+                                    continue
+                                if time_pat.match(line):
+                                    continue
+                                if line.replace(',', '').replace('.', '').isdigit():
+                                    continue
+                                if idx == 0 and len(line) < 40:
+                                    author = line
+                                else:
+                                    text_parts.append(line)
+                            if text_parts:
+                                comment_text = ' '.join(text_parts)
+                                if len(comment_text) > 3 and not any(c.get('text') == comment_text[:1000] for c in comments):
+                                    comments.append({
+                                        "author": author if author else "Facebook 사용자",
+                                        "text": comment_text[:1000]
+                                    })
+                        except Exception:
+                            continue
                     if comments:
                         logger.info(f"DOM에서 댓글 {len(comments)}개 추출")
                         return comments
@@ -1971,11 +1999,10 @@ class FacebookCrawler:
             self._last_scoped_source = None
             self._scoping_succeeded = False
 
-            # 브라우저 캐시 초기화 (이전 포스트 데이터 오염 방지)
+            # 이전 포스트 페이지 초기화 (캐시는 유지 — JS/CSS 재다운로드 방지)
             try:
                 self.driver.get("about:blank")
-                self.driver.execute_cdp_cmd("Network.clearBrowserCache", {})
-                time.sleep(1)
+                time.sleep(0.5)
             except Exception:
                 pass
 
@@ -3089,34 +3116,29 @@ class FacebookCrawler:
                                                 except Exception:
                                                     break
 
-                                            # 작성자 찾기
+                                            # container.text 파싱으로 작성자+댓글 추출 (2026 Facebook DOM 대응)
                                             author = None
-                                            author_links = container.find_elements(By.XPATH, ".//a[@role='link']")
-                                            for link in author_links[:5]:
-                                                link_text = link.text.strip()
-                                                if link_text and 1 < len(link_text) < 40:
-                                                    skip_ui = ['좋아요', '답글', '공유', '더 보기', '번역', 'Like', 'Reply', 'Share']
-                                                    if not any(skip in link_text for skip in skip_ui):
-                                                        if not re.match(r'^\d+\s*(시간|분|일|주|hour|min|day|week)', link_text):
-                                                            # 숫자/통계 텍스트 및 UI 메뉴 제외
-                                                            if not is_stat_text(link_text) and not is_fb_ui_menu(link_text):
-                                                                author = link_text
-                                                                break
-
-                                            # 댓글 텍스트 찾기
                                             comment_text = None
-                                            spans = container.find_elements(By.XPATH, ".//span[@dir='auto']")
-                                            for span in spans:
-                                                text = span.text.strip()
-                                                if text and len(text) > 5 and text != author:
-                                                    skip_words = ['좋아요', '답글', 'reply', '공유', '더 보기', '번역',
-                                                                  '동영상에서', '둘러보기', '새로운 소식']
-                                                    if not any(skip in text.lower() for skip in skip_words):
-                                                        if not re.match(r'^\d+\s*(시간|분|일|주|초)', text):
-                                                            # 숫자/통계 텍스트 제외
-                                                            if not is_stat_text(text):
-                                                                comment_text = text
-                                                                break
+                                            container_text = (container.text or '').strip()
+                                            if container_text:
+                                                lines = [l.strip() for l in container_text.split('\n') if l.strip()]
+                                                ui_keywords = ['좋아요', '답글 달기', '공유', '더 보기', '번역 보기',
+                                                               'Like', 'Reply', 'Share', 'See more', 'Translate']
+                                                time_pat = re.compile(r'^\d+\s*(초|분|시간|일|주|개월|년|sec|min|hour|day|week|month|year)', re.IGNORECASE)
+                                                content_lines = []
+                                                for idx, line in enumerate(lines):
+                                                    if any(line == kw for kw in ui_keywords):
+                                                        continue
+                                                    if time_pat.match(line):
+                                                        continue
+                                                    if is_stat_text(line) or is_fb_ui_menu(line):
+                                                        continue
+                                                    if idx == 0 and len(line) < 40:
+                                                        author = line
+                                                    else:
+                                                        content_lines.append(line)
+                                                if content_lines:
+                                                    comment_text = ' '.join(content_lines)
 
                                             if comment_text and len(comment_text) > 5:
                                                 if not any(c.get('text') == comment_text[:1000] for c in comments_list):
@@ -3760,6 +3782,35 @@ class FacebookCrawler:
                             logger.info(f"후처리에서 og:image 썸네일 추출: {thumb[:60]}...")
             except Exception as e:
                 logger.debug(f"썸네일 후처리 실패: {e}")
+
+        # 썸네일 중복 감지: 다른 포스트와 같은 이미지면 제거 후 재시도
+        if result and result.get('thumbnail'):
+            thumb_base = re.sub(r'[?&].*', '', result['thumbnail'])  # 쿼리 파라미터 제거
+            if thumb_base in self._used_thumbnails:
+                logger.warning(f"썸네일 중복 감지 (이전 포스트와 동일), 재추출 시도: {thumb_base[:60]}...")
+                result['thumbnail'] = None
+                # requests.get으로 공개 og:image 재시도
+                try:
+                    pub_resp = requests.get(
+                        url, timeout=10, allow_redirects=True,
+                        headers={'User-Agent': 'Mozilla/5.0 (compatible; facebookexternalhit/1.1)'}
+                    )
+                    if pub_resp.status_code == 200:
+                        og_m = re.search(
+                            '<meta\\s+property=["\']og:image["\']\\s+content=["\'](https?://[^"\']+)',
+                            pub_resp.text, re.IGNORECASE
+                        )
+                        if og_m:
+                            new_thumb = og_m.group(1)
+                            new_base = re.sub(r'[?&].*', '', new_thumb)
+                            if (new_base not in self._used_thumbnails
+                                    and not self._is_profile_thumbnail(new_thumb)):
+                                result['thumbnail'] = new_thumb
+                                logger.info(f"중복 해소: 공개 og:image에서 새 썸네일 추출: {new_thumb[:60]}...")
+                except Exception as e:
+                    logger.debug(f"중복 해소 실패: {e}")
+            if result.get('thumbnail'):
+                self._used_thumbnails.add(thumb_base if result['thumbnail'] == thumb_base else re.sub(r'[?&].*', '', result['thumbnail']))
 
         return result
 
