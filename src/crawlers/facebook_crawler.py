@@ -1160,6 +1160,19 @@ class FacebookCrawler:
 
         return 0
 
+    @staticmethod
+    def _is_profile_thumbnail(url: str) -> bool:
+        """프로필 사진 URL 감지 (작은 리사이즈 이미지 필터)"""
+        if not url:
+            return False
+        # s40x40, s50x50 등 작은 리사이즈 패턴 (Facebook CDN stp 파라미터)
+        size_match = re.search(r's(\d+)x(\d+)', url)
+        if size_match:
+            w, h = int(size_match.group(1)), int(size_match.group(2))
+            if max(w, h) <= 200:
+                return True
+        return False
+
     def _extract_comment_list(self, driver: webdriver.Chrome, max_comments: int = 10) -> list:
         """
         댓글 내용 추출
@@ -2481,20 +2494,30 @@ class FacebookCrawler:
                     og_match = re.search(r'content=["\'](https?://[^"\']+)["\'].*?property=["\']og:image', page_src, re.IGNORECASE)
                 if og_match:
                     thumb = og_match.group(1)
-                    # Facebook CDN 이미지인지 확인 (프로필 아이콘 제외)
-                    if thumb and ('fbcdn' in thumb or 'facebook' in thumb) and 'emoji' not in thumb:
+                    # Facebook CDN 이미지인지 확인 (프로필 아이콘/작은 이미지 제외)
+                    if (thumb and ('fbcdn' in thumb or 'facebook' in thumb)
+                            and 'emoji' not in thumb
+                            and not self._is_profile_thumbnail(thumb)):
                         result["thumbnail"] = thumb
                         logger.info(f"og:image 썸네일 추출: {thumb[:60]}...")
+                    elif thumb and self._is_profile_thumbnail(thumb):
+                        logger.debug(f"og:image가 프로필 사진이라 건너뜀: {thumb[:60]}...")
                 if not result.get("thumbnail"):
-                    # JSON에서 이미지 URL 추출 (fallback)
-                    img_match = re.search(r'"preferred_thumbnail_image":\{"uri":"([^"]+)"', page_src)
-                    if not img_match:
-                        img_match = re.search(r'"image":\{"uri":"([^"]+)"', page_src)
-                    if img_match:
-                        thumb_url = img_match.group(1).replace('\\/', '/')
-                        if 'fbcdn' in thumb_url:
-                            result["thumbnail"] = thumb_url
-                            logger.info(f"JSON 썸네일 추출: {thumb_url[:60]}...")
+                    # JSON에서 이미지 URL 추출 (fallback — 게시물 본문 이미지 우선)
+                    json_img_patterns = [
+                        r'"preferred_thumbnail_image":\{"uri":"([^"]+)"',
+                        r'"photo_image":\{"uri":"([^"]+)"',
+                        r'"full_width_image":\{"uri":"([^"]+)"',
+                        r'"image":\{"uri":"([^"]+)"',
+                    ]
+                    for pat in json_img_patterns:
+                        img_match = re.search(pat, page_src)
+                        if img_match:
+                            thumb_url = img_match.group(1).replace('\\/', '/')
+                            if 'fbcdn' in thumb_url and not self._is_profile_thumbnail(thumb_url):
+                                result["thumbnail"] = thumb_url
+                                logger.info(f"JSON 썸네일 추출: {thumb_url[:60]}...")
+                                break
             except Exception as e:
                 logger.debug(f"썸네일 추출 실패: {e}")
 
@@ -3277,7 +3300,9 @@ class FacebookCrawler:
 
             # 댓글 내용 수집
             if self.collect_comments:
-                result["comment_list"] = self._extract_comment_list(self.driver, self.max_comments)
+                extracted_comments = self._extract_comment_list(self.driver, self.max_comments)
+                if extracted_comments:
+                    result["comments_list"] = extracted_comments
 
             logger.info(
                 f"데이터 추출 완료: likes={result['likes']}, "
@@ -3648,7 +3673,9 @@ class FacebookCrawler:
                                 )
                             if og_match:
                                 thumb = og_match.group(1)
-                                if thumb and ('fbcdn' in thumb or 'facebook' in thumb) and 'emoji' not in thumb:
+                                if (thumb and ('fbcdn' in thumb or 'facebook' in thumb)
+                                        and 'emoji' not in thumb
+                                        and not self._is_profile_thumbnail(thumb)):
                                     result['thumbnail'] = thumb
                                     logger.info(f"API 경로에서 og:image 썸네일 추출: {thumb[:60]}...")
                     except Exception as e:
@@ -3726,7 +3753,9 @@ class FacebookCrawler:
                         )
                     if og_match:
                         thumb = og_match.group(1)
-                        if thumb and ('fbcdn' in thumb or 'facebook' in thumb) and 'emoji' not in thumb:
+                        if (thumb and ('fbcdn' in thumb or 'facebook' in thumb)
+                                and 'emoji' not in thumb
+                                and not self._is_profile_thumbnail(thumb)):
                             result['thumbnail'] = thumb
                             logger.info(f"후처리에서 og:image 썸네일 추출: {thumb[:60]}...")
             except Exception as e:
